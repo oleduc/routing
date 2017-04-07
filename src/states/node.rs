@@ -1300,8 +1300,9 @@ impl Node {
         }
         let start = Instant::now();
         let rp_object = ResourceProof::new(target_size, difficulty);
-        let mut proof = rp_object.create_proof_data(&seed);
-        let leading_zero_bytes = rp_object.create_proof(&mut proof);
+        let proof = rp_object.create_proof_data(&seed);
+        let mut prover = rp_object.create_prover(proof.clone());
+        let leading_zero_bytes = prover.solve();
         let elapsed = start.elapsed();
         let parts = proof
             .into_iter()
