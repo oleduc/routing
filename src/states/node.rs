@@ -1532,86 +1532,6 @@ impl Node {
         Ok(())
     }
 
-<<<<<<< HEAD
-    fn handle_resource_proof_request(&mut self,
-                                     peer_id: PeerId,
-                                     seed: Vec<u8>,
-                                     target_size: usize,
-                                     difficulty: u8)
-                                     -> Result<(), RoutingError> {
-        if self.resource_proof_response_parts.is_empty() {
-            info!("{:?} Starting approval process to test this node's resources. This will take \
-                   at least {} seconds.",
-                  self,
-                  RESOURCE_PROOF_DURATION_SECS);
-        }
-        let start = Instant::now();
-        let rp_object = ResourceProof::new(target_size, difficulty);
-        let proof = rp_object.create_proof_data(&seed);
-        let mut prover = rp_object.create_prover(proof.clone());
-        let leading_zero_bytes = prover.solve();
-        let elapsed = start.elapsed();
-        let parts = proof
-            .into_iter()
-            .chunks(MAX_PART_LEN)
-            .into_iter()
-            .map(|chunk| chunk.collect_vec())
-            .collect_vec();
-        let part_count = parts.len();
-        let mut messages = parts
-            .into_iter()
-            .enumerate()
-            .rev()
-            .map(|(part_index, part)| {
-                     DirectMessage::ResourceProofResponse {
-                         part_index: part_index,
-                         part_count: part_count,
-                         proof: part,
-                         leading_zero_bytes: leading_zero_bytes,
-                     }
-                 })
-            .collect_vec();
-        let first_message = match messages.pop() {
-            Some(message) => message,
-            None => {
-                DirectMessage::ResourceProofResponse {
-                    part_index: 0,
-                    part_count: 1,
-                    proof: vec![],
-                    leading_zero_bytes: leading_zero_bytes,
-                }
-            }
-        };
-        let _ = self.resource_proof_response_parts
-            .insert(peer_id, messages);
-        self.send_direct_message(peer_id, first_message);
-        trace!("{:?} created proof data in {}. Min section size: {}, Target size: {}, \
-                Difficulty: {}, Seed: {:?}",
-               self,
-               Self::format(elapsed),
-               self.min_section_size(),
-               target_size,
-               difficulty,
-               seed);
-        Ok(())
-    }
-
-    fn handle_resource_proof_response_receipt(&mut self, peer_id: PeerId) {
-        let popped_message = self.resource_proof_response_parts
-            .get_mut(&peer_id)
-            .and_then(Vec::pop);
-        if let Some(message) = popped_message {
-            self.send_direct_message(peer_id, message);
-        }
-    }
-
-    fn handle_resource_proof_response(&mut self,
-                                      peer_id: PeerId,
-                                      part_index: usize,
-                                      part_count: usize,
-                                      proof: Vec<u8>,
-                                      leading_zero_bytes: u64) {
-=======
     fn handle_resource_proof_response(
         &mut self,
         pub_id: PublicId,
@@ -1620,7 +1540,6 @@ impl Node {
         proof: Vec<u8>,
         leading_zero_bytes: u64,
     ) {
->>>>>>> a2c0029ca3f0b8770443006d49e28328e62f8ac3
         if self.candidate_timer_token.is_none() {
             debug!(
                 "{:?} Won't handle resource proof response from {:?} - not currently waiting.",
