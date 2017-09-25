@@ -1,5 +1,50 @@
 # Routing - Change Log
 
+## [0.33.2]
+- Depend on Crust 0.28.1.
+
+## [0.33.1]
+- Increase MAX_MUTABLE_DATA_ENTRIES from 100 to 1000.
+
+## [0.33.0]
+- Rate limiter refund on overcharge for get response.
+- Rate limiter having soft capacity for clients.
+- Bugfix to not mutate peer on receiving conn_info_response.
+- Bugfix to remove expired peers(normalise peers) when receiving TunnelSuccess or TunnelRequest.
+- Enforce one client per IP only on bootstrap request.
+- Add Rand impl for PermissionSet.
+- Resend rate exceeded user message parts and remove Event::ProxyRateLimitExceeded
+- Bugfix to not reject BootstrapRequest messages invalidly.
+
+## [0.32.2]
+- Bugfix to avoid adding nodes to disconnected client list.
+
+## [0.32.1]
+- Bugfix to avoid handling recently-disconnected client direct messages.
+
+## [0.32.0]
+- Allow mock-crust network to support multiple nodes/clients with the same IPs.
+- Allow only one client ip per proxy.
+- Modify the client Rate Limiter paradigm to not put an upper threshold on number of clients with unique IPs to bootstrap off a proxy.
+- Add dev configuration options for routing such that these options can be supplied in a routing config file that routing would read to tweak parameters such as disable resource proof etc.
+- Update to use Rust Stable 1.19.0 / Nightly 2017-07-20, clippy 0.0.144, and rustfmt 0.9.0.
+- Make MutableData errors more descriptive.
+
+## [0.31.0]
+- Remove support for Structured, PrivAppendable and PubAppendable Data
+- Add Support for MutableData instead.
+- Introduce mock-crypto which provides efficient mocking of the crypto primitives for faster test runs for cases where we don't care about tightness of security.
+- Code rate-limiter to restrict proxy from relaying more than the agreed threshold to the Network on behalf of the clients (each client being identified on IP level).
+- Detect malformed messages and invalid/disallowed RPCs and ban such a sender on IP level.
+
+## [0.30.0]
+- Replace all sha256 from rust_sodium with sha3_256 from tiny_keccak.
+- Move `AccountPacket` type required by vaults and clients into a `common_types` module.
+
+## [0.29.0]
+- Integration with templatised Crust where now routing specifies what to use as a UID so that crust and routing use a common UID to identify peer.
+- Peer manager clean up as connect success now tells us everything about the peer. Previously we needed to wait additionally for NodeIdentify for instance as crust-uid (PeerId) and routing-uid (PublicId) were separate and each layer informed about the id specific to that layer only.
+
 ## [0.28.5]
 - Add section update requests to make merges more stable.
 - Don't approve new node if routing table is invalid.

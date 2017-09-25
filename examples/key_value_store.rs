@@ -43,7 +43,6 @@ extern crate maidsafe_utilities;
 #[macro_use]
 extern crate unwrap;
 extern crate docopt;
-extern crate rustc_serialize;
 extern crate rust_sodium;
 #[macro_use]
 extern crate serde_derive;
@@ -52,6 +51,7 @@ extern crate routing;
 extern crate lru_time_cache;
 
 mod utils;
+
 
 #[cfg(feature = "use-mock-crust")]
 fn main() {
@@ -66,15 +66,16 @@ mod unnamed {
     use maidsafe_utilities::log;
     use maidsafe_utilities::serialisation::{deserialise, serialise};
     use maidsafe_utilities::thread::{self, Joiner};
-    use routing::{Data, DataIdentifier, StructuredData, XorName};
+    use routing::{MutableData, Value, XorName};
     use rust_sodium::crypto;
-    use std::collections::BTreeSet;
     use std::io::{self, Write};
+    use std::iter;
     use std::sync::mpsc;
     use std::sync::mpsc::{Receiver, Sender};
     use std::thread as std_thread;
     use std::time::Duration;
     use utils::{ExampleClient, ExampleNode};
+
     // ==========================   Program Options   =================================
     #[cfg_attr(rustfmt, rustfmt_skip)]
     static USAGE: &'static str = "
@@ -99,7 +100,10 @@ Options:
   network discovery patterns to use, or which seed nodes to use.
 ";
 
-    #[derive(RustcDecodable, Debug)]
+    const TAG: u64 = 10_000;
+    const KEY: &'static [u8] = &[];
+
+    #[derive(Debug, Deserialize)]
     struct Args {
         flag_first: bool,
         flag_node: bool,
@@ -133,8 +137,10 @@ Options:
             } else if parts.len() == 2 && parts[0] == "get" {
                 let _ = command_sender.send(UserCommand::Get(parts[1].to_string()));
             } else if parts.len() == 3 && parts[0] == "put" {
-                let _ = command_sender.send(UserCommand::Put(parts[1].to_string(),
-                                                             parts[2].to_string()));
+                let _ = command_sender.send(UserCommand::Put(
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                ));
             } else {
                 println!("Unrecognised command");
             }
@@ -156,8 +162,10 @@ Options:
                 example_client: example_client,
                 command_receiver: command_receiver,
                 exit: false,
-                _joiner: thread::named("Command reader",
-                                       move || read_user_commands(&command_sender)),
+                _joiner: thread::named(
+                    "Command reader",
+                    move || read_user_commands(&command_sender),
+                ),
             }
         }
 
@@ -193,35 +201,36 @@ Options:
 
         /// Get data from the network.
         pub fn get(&mut self, what: String) {
-            let name = KeyValueStore::calculate_key_name(&what);
-            let data = self.example_client
-                .get(DataIdentifier::Structured(name, 10000));
-            match data {
-                Some(data) => {
-                    let sd = if let Data::Structured(sd) = data {
-                        sd
-                    } else {
-                        error!("KeyValueStore: Only storing structured data in this example");
-                        return;
-                    };
-                    if let Ok((key, value)) = deserialise::<(String, String)>(sd.get_data()) {
-                        println!("Got value {:?} on key {:?}", value, key);
-                    } else {
-                        error!("Failed to decode get response.");
-                        return;
-                    };
+            let name = Self::calculate_key_name(&what);
+            match self.example_client.get_mdata_value(name, TAG, KEY.to_vec()) {
+                Ok(value) => {
+                    let content = unwrap!(deserialise::<String>(&value.content));
+                    println!("Got value {:?} on key {:?}", content, what);
                 }
-                None => println!("Failed to get {:?}", what),
+                Err(error) => println!("Failed to get {:?} ({:?})", what, error),
             }
         }
 
         /// Put data onto the network.
-        pub fn put(&self, put_where: String, put_what: String) {
-            let name = KeyValueStore::calculate_key_name(&put_where);
-            let data = unwrap!(serialise(&(put_where, put_what)));
-            let sd = unwrap!(StructuredData::new(10000, name, 0, data, BTreeSet::new()));
-            if self.example_client.put(Data::Structured(sd)).is_err() {
-                error!("Failed to put data.");
+        pub fn put(&mut self, put_where: String, put_what: String) {
+            let name = Self::calculate_key_name(&put_where);
+
+            let value = Value {
+                content: unwrap!(serialise(&put_what)),
+                entry_version: 0,
+            };
+            let entries = iter::once((KEY.to_vec(), value)).collect();
+            let owners = iter::once(*self.example_client.signing_public_key()).collect();
+
+            let data = unwrap!(MutableData::new(
+                name,
+                TAG,
+                Default::default(),
+                entries,
+                owners,
+            ));
+            if let Err(error) = self.example_client.put_mdata(data) {
+                error!("Failed to put data ({:?})", error);
             }
         }
 
@@ -240,7 +249,7 @@ Options:
         unwrap!(log::init(false));
 
         let args: Args = Docopt::new(USAGE)
-            .and_then(|docopt| docopt.decode())
+            .and_then(|docopt| docopt.deserialize())
             .unwrap_or_else(|error| error.exit());
 
         if args.flag_first {

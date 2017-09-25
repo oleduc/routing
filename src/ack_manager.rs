@@ -16,6 +16,8 @@
 // relating to use of the SAFE Network Software.
 
 use error::RoutingError;
+#[cfg(feature = "use-mock-crust")]
+use fake_clock::FakeClock as Instant;
 use maidsafe_utilities::serialisation;
 use message_filter::MessageFilter;
 use messages::RoutingMessage;
@@ -23,6 +25,8 @@ use sha3;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
+#[cfg(not(feature = "use-mock-crust"))]
+use std::time::Instant;
 use tiny_keccak::sha3_256;
 
 /// Time (in seconds) after which a message is resent due to being unacknowledged by recipient.
@@ -36,6 +40,7 @@ pub struct UnacknowledgedMessage {
     pub routing_msg: RoutingMessage,
     pub route: u8,
     pub timer_token: u64,
+    pub expires_at: Option<Instant>,
 }
 
 pub struct AckManager {
@@ -75,10 +80,11 @@ impl AckManager {
 
     /// Adds a pending message; if another with the same `Ack` identifier exists,
     /// this is removed and returned.
-    pub fn add_to_pending(&mut self,
-                          ack: Ack,
-                          unacked_msg: UnacknowledgedMessage)
-                          -> Option<UnacknowledgedMessage> {
+    pub fn add_to_pending(
+        &mut self,
+        ack: Ack,
+        unacked_msg: UnacknowledgedMessage,
+    ) -> Option<UnacknowledgedMessage> {
         self.pending.insert(ack, unacked_msg)
     }
 
@@ -87,9 +93,10 @@ impl AckManager {
     // returns None.
     pub fn find_timed_out(&mut self, token: u64) -> Option<(UnacknowledgedMessage, Ack)> {
         let timed_out_ack = if let Some((sip_hash, _)) =
-            self.pending
-                .iter()
-                .find(|&(_, unacked_msg)| unacked_msg.timer_token == token) {
+            self.pending.iter().find(|&(_, unacked_msg)| {
+                unacked_msg.timer_token == token
+            })
+        {
             *sip_hash
         } else {
             return None;
@@ -101,25 +108,10 @@ impl AckManager {
 
         Some((unacked_msg, timed_out_ack))
     }
-}
 
-#[cfg(feature = "use-mock-crust")]
-impl AckManager {
-    /// Are we waiting for any acks?
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// Collects all time-out tokens.
-    pub fn timer_tokens(&self) -> Vec<u64> {
-        self.pending
-            .iter()
-            .map(|(_, unacked_msg)| unacked_msg.timer_token)
-            .collect::<Vec<_>>()
-    }
-
-    pub fn clear(&mut self) {
-        self.received.clear()
+    // Removes a pending `UnacknowledgedMessage` and returns the same if found.
+    pub fn remove(&mut self, ack: &Ack) -> Option<UnacknowledgedMessage> {
+        self.pending.remove(ack)
     }
 }
 
@@ -133,9 +125,11 @@ impl Ack {
 
 impl fmt::Debug for Ack {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        write!(formatter,
-               "Ack({:02x}{:02x}..)",
-               self.m_hash[0],
-               self.m_hash[1])
+        write!(
+            formatter,
+            "Ack({:02x}{:02x}..)",
+            self.m_hash[0],
+            self.m_hash[1]
+        )
     }
 }

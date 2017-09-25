@@ -23,6 +23,31 @@ use std::hash::{Hash, Hasher};
 #[cfg(test)]
 use std::str::FromStr;
 
+/// A prefix with section version.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct VersionedPrefix<T: Clone + Copy + Default + Binary + Xorable> {
+    prefix: Prefix<T>,
+    version: u64,
+}
+
+impl<T: Clone + Copy + Default + Binary + Xorable> VersionedPrefix<T> {
+    /// Returns the prefix.
+    pub fn prefix(&self) -> &Prefix<T> {
+        &self.prefix
+    }
+
+    /// Returns the version number.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl<T: Clone + Copy + Default + Binary + Xorable> Into<(Prefix<T>, u64)> for VersionedPrefix<T> {
+    fn into(self) -> (Prefix<T>, u64) {
+        (self.prefix, self.version)
+    }
+}
+
 /// A section prefix, i.e. a sequence of bits specifying the part of the network's name space
 /// consisting of all names that start with this sequence.
 #[derive(Clone, Copy, Default, Eq, Deserialize, Serialize)]
@@ -39,6 +64,14 @@ impl<T: Clone + Copy + Default + Binary + Xorable> Prefix<T> {
         Prefix {
             bit_count: cmp::min(bit_count, T::bit_len()) as u16,
             name: name.set_remaining(bit_count, false),
+        }
+    }
+
+    /// Returns a `VersionedPrefix` with this prefix and the given version number.
+    pub fn with_version(self, version: u64) -> VersionedPrefix<T> {
+        VersionedPrefix {
+            prefix: self,
+            version: version,
         }
     }
 
@@ -73,6 +106,12 @@ impl<T: Clone + Copy + Default + Binary + Xorable> Prefix<T> {
         i >= self.bit_count() || i >= other.bit_count()
     }
 
+    /// Returns `true` if `other` is compatible but strictly shorter than `self`.
+    pub fn is_extension_of(&self, other: &Prefix<T>) -> bool {
+        let i = self.name.common_prefix(&other.name);
+        i >= other.bit_count() && self.bit_count() > other.bit_count()
+    }
+
     /// Returns `true` if the `other` prefix differs in exactly one bit from this one.
     pub fn is_neighbour(&self, other: &Prefix<T>) -> bool {
         let i = self.name.common_prefix(&other.name);
@@ -89,11 +128,6 @@ impl<T: Clone + Copy + Default + Binary + Xorable> Prefix<T> {
         cmp::min(self.bit_count(), self.name.common_prefix(name))
     }
 
-    /// Returns the number of common leading bits with the input name.
-    pub fn max_identical_index(&self, name: &T) -> usize {
-        self.name.common_prefix(name)
-    }
-
     /// Returns `true` if this is a prefix of the given `name`.
     pub fn matches(&self, name: &T) -> bool {
         self.name.common_prefix(name) >= self.bit_count()
@@ -108,8 +142,10 @@ impl<T: Clone + Copy + Default + Binary + Xorable> Prefix<T> {
             // one is a prefix of the other (is_compatible).
             Ord::cmp(&self.bit_count, &other.bit_count)
         } else {
-            Ord::cmp(&other.name.common_prefix(target),
-                     &self.name.common_prefix(target))
+            Ord::cmp(
+                &other.name.common_prefix(target),
+                &self.name.common_prefix(target),
+            )
         }
     }
 
@@ -126,8 +162,9 @@ impl<T: Clone + Copy + Default + Binary + Xorable> Prefix<T> {
     /// Returns whether the namespace defined by `self` is covered by prefixes in the `prefixes`
     /// set
     pub fn is_covered_by<'a, U>(&self, prefixes: U) -> bool
-        where T: 'a,
-              U: IntoIterator<Item = &'a Prefix<T>> + Clone
+    where
+        T: 'a,
+        U: IntoIterator<Item = &'a Prefix<T>> + Clone,
     {
         let max_prefix_len = prefixes
             .clone()
@@ -139,18 +176,22 @@ impl<T: Clone + Copy + Default + Binary + Xorable> Prefix<T> {
     }
 
     fn is_covered_by_impl<'a, U>(&self, prefixes: U, max_prefix_len: usize) -> bool
-        where T: 'a,
-              U: IntoIterator<Item = &'a Prefix<T>> + Clone
+    where
+        T: 'a,
+        U: IntoIterator<Item = &'a Prefix<T>> + Clone,
     {
-        prefixes
-            .clone()
-            .into_iter()
-            .any(|x| x.is_compatible(self) && x.bit_count() <= self.bit_count()) ||
-        (self.bit_count() <= max_prefix_len &&
-         self.pushed(false)
-             .is_covered_by_impl(prefixes.clone(), max_prefix_len) &&
-         self.pushed(true)
-             .is_covered_by_impl(prefixes, max_prefix_len))
+        prefixes.clone().into_iter().any(|x| {
+            x.is_compatible(self) && x.bit_count() <= self.bit_count()
+        }) ||
+            (self.bit_count() <= max_prefix_len &&
+                 self.pushed(false).is_covered_by_impl(
+                    prefixes.clone(),
+                    max_prefix_len,
+                ) &&
+                 self.pushed(true).is_covered_by_impl(
+                    prefixes,
+                    max_prefix_len,
+                ))
     }
 
     /// Returns the neighbouring prefix differing in the `i`-th bit
@@ -237,8 +278,10 @@ impl FromStr for Prefix<u8> {
             if bit == '1' {
                 name |= 1 << (7 - i);
             } else if bit != '0' {
-                return Err(format!("'{}' not allowed - the string must represent a binary number.",
-                                   bit));
+                return Err(format!(
+                    "'{}' not allowed - the string must represent a binary number.",
+                    bit
+                ));
             }
         }
         Ok(Prefix::new(bits.len(), name))
@@ -252,23 +295,39 @@ mod tests {
 
     #[test]
     fn prefix() {
-        assert_eq!(unwrap!(Prefix::from_str("101")).pushed(true),
-                   unwrap!(Prefix::from_str("1011")));
-        assert_eq!(unwrap!(Prefix::from_str("101")).pushed(false),
-                   unwrap!(Prefix::from_str("1010")));
-        assert_eq!(unwrap!(Prefix::from_str("1011")).popped(),
-                   unwrap!(Prefix::from_str("101")));
-        assert!(unwrap!(Prefix::from_str("101")).is_compatible(&unwrap!(Prefix::from_str("1010"))));
-        assert!(unwrap!(Prefix::from_str("1010")).is_compatible(&unwrap!(Prefix::from_str("101"))));
-        assert!(!unwrap!(Prefix::from_str("1010")).is_compatible(
-            &unwrap!(Prefix::from_str("1011"))));
-        assert!(unwrap!(Prefix::from_str("101")).is_neighbour(&unwrap!(Prefix::from_str("1111"))));
-        assert!(!unwrap!(Prefix::from_str("1010")).is_neighbour(
-            &unwrap!(Prefix::from_str("1111"))));
-        assert!(unwrap!(Prefix::from_str("1010")).is_neighbour(
-            &unwrap!(Prefix::from_str("10111"))));
-        assert!(!unwrap!(Prefix::from_str("101")).is_neighbour(
-            &unwrap!(Prefix::from_str("10111"))));
+        assert_eq!(
+            unwrap!(Prefix::from_str("101")).pushed(true),
+            unwrap!(Prefix::from_str("1011"))
+        );
+        assert_eq!(
+            unwrap!(Prefix::from_str("101")).pushed(false),
+            unwrap!(Prefix::from_str("1010"))
+        );
+        assert_eq!(
+            unwrap!(Prefix::from_str("1011")).popped(),
+            unwrap!(Prefix::from_str("101"))
+        );
+        assert!(unwrap!(Prefix::from_str("101")).is_compatible(&unwrap!(
+            Prefix::from_str("1010")
+        )));
+        assert!(unwrap!(Prefix::from_str("1010")).is_compatible(&unwrap!(
+            Prefix::from_str("101")
+        )));
+        assert!(!unwrap!(Prefix::from_str("1010")).is_compatible(&unwrap!(
+            Prefix::from_str("1011")
+        )));
+        assert!(unwrap!(Prefix::from_str("101")).is_neighbour(&unwrap!(
+            Prefix::from_str("1111")
+        )));
+        assert!(!unwrap!(Prefix::from_str("1010")).is_neighbour(&unwrap!(
+            Prefix::from_str("1111")
+        )));
+        assert!(unwrap!(Prefix::from_str("1010")).is_neighbour(&unwrap!(
+            Prefix::from_str("10111")
+        )));
+        assert!(!unwrap!(Prefix::from_str("101")).is_neighbour(&unwrap!(
+            Prefix::from_str("10111")
+        )));
         assert!(unwrap!(Prefix::from_str("101")).matches(&0b10101100));
         assert!(!unwrap!(Prefix::from_str("1011")).matches(&0b10101100));
 

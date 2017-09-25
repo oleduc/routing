@@ -1,4 +1,4 @@
-// Copyright 2015 MaidSafe.net limited.
+// Copyright 2016 MaidSafe.net limited.
 //
 // This SAFE Network Software is licensed to you under (1) the MaidSafe.net Commercial License,
 // version 1.0 or later, or (2) The General Public License (GPL), version 3, depending on which
@@ -15,25 +15,25 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
-use super::QUORUM;
+mod request;
+mod response;
+
+pub use self::request::Request;
+pub use self::response::{AccountInfo, Response};
+use super::{QUORUM_DENOMINATOR, QUORUM_NUMERATOR};
 use ack_manager::Ack;
-#[cfg(not(feature = "use-mock-crust"))]
-use crust::PeerId;
-use data::{AppendWrapper, Data, DataIdentifier};
-use error::RoutingError;
+use data::MAX_IMMUTABLE_DATA_SIZE_IN_BYTES;
+use error::{BootstrapResponseError, RoutingError};
 use event::Event;
 use id::{FullId, PublicId};
 use itertools::Itertools;
 use lru_time_cache::LruCache;
 use maidsafe_utilities::serialisation::{deserialise, serialise};
-#[cfg(feature = "use-mock-crust")]
-use mock_crust::crust::PeerId;
 use peer_manager::SectionMap;
-use routing_table::{Prefix, Xorable};
+use routing_table::{Prefix, VersionedPrefix, Xorable};
 use routing_table::Authority;
 use rust_sodium::crypto::{box_, sign};
-use rust_sodium::crypto::hash::sha256;
-use sha3;
+use sha3::Digest256;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{self, Debug, Formatter};
 use std::iter;
@@ -45,6 +45,7 @@ use xor_name::XorName;
 
 /// The maximal length of a user message part, in bytes.
 pub const MAX_PART_LEN: usize = 20 * 1024;
+pub const MAX_PARTS: u32 = ((MAX_IMMUTABLE_DATA_SIZE_IN_BYTES / MAX_PART_LEN as u64) + 1) as u32;
 
 /// Get and refresh messages from nodes have a high priority: They relocate data under churn and are
 /// critical to prevent data loss.
@@ -60,7 +61,7 @@ pub const CLIENT_GET_PRIORITY: u8 = 3;
 /// This is the only type allowed to be sent / received on the network.
 #[derive(Debug, Serialize, Deserialize)]
 // FIXME - See https://maidsafe.atlassian.net/browse/MAID-2026 for info on removing this exclusion.
-#[cfg_attr(feature="cargo-clippy", allow(large_enum_variant))]
+#[cfg_attr(feature = "cargo-clippy", allow(large_enum_variant))]
 pub enum Message {
     /// A message sent between two nodes directly
     Direct(DirectMessage),
@@ -71,18 +72,18 @@ pub enum Message {
         /// The wrapped message
         content: DirectMessage,
         /// The sender
-        src: PeerId,
+        src: PublicId,
         /// The receiver
-        dst: PeerId,
+        dst: PublicId,
     },
     /// A hop message sent via a tunnel because the nodes could not connect directly
     TunnelHop {
         /// The wrapped message
         content: HopMessage,
         /// The sender
-        src: PeerId,
+        src: PublicId,
         /// The receiver
-        dst: PeerId,
+        dst: PublicId,
     },
 }
 
@@ -101,66 +102,48 @@ impl Message {
 ///
 /// Allows routing to directly send specific messages between nodes.
 #[derive(Serialize, Deserialize)]
+// FIXME - See https://maidsafe.atlassian.net/browse/MAID-2026 for info on removing this exclusion.
+#[cfg_attr(feature = "cargo-clippy", allow(large_enum_variant))]
 pub enum DirectMessage {
     /// Sent from members of a section or group message's source authority to the first hop. The
     /// message will only be relayed once enough signatures have been accumulated.
-    MessageSignature(sha256::Digest, sign::Signature),
+    MessageSignature(Digest256, sign::Signature),
     /// A signature for the current `BTreeSet` of section's node names
     SectionListSignature(SectionList, sign::Signature),
-    /// Sent from the bootstrap node to a client in response to `ClientIdentify`.
-    BootstrapIdentify {
-        /// The bootstrap node's keys and name.
-        public_id: PublicId,
-    },
-    /// Sent to the client to indicate that this node is not available as a bootstrap node.
-    BootstrapDeny,
-    /// Sent from a newly connected client to the bootstrap node to inform it about the client's
-    /// public ID.
-    ClientIdentify {
-        /// Serialised keys and claimed name.
-        serialised_public_id: Vec<u8>,
-        /// Signature of the client.
-        signature: sign::Signature,
-        /// Indicate whether we intend to remain a client, as opposed to becoming a routing node.
-        client_restriction: bool,
-    },
-    /// Sent from an established node (i.e. one which has successfully joined the network) to
-    /// another node, to allow the latter to add the former to its routing table.
-    NodeIdentify {
-        /// Keys and claimed name, serialised outside routing.
-        serialised_public_id: Vec<u8>,
-        /// Signature of the originator of this message.
-        signature: sign::Signature,
-        /// FIXME: Should be deprecated.
-        /// Tunnel connection indicator from sender which would override
-        /// intermediate peer_mgr states for routing table connection type.
-        /// Should not influence JoiningNode / Proxy states which are expected to be direct only.
-        is_tunnel: bool,
-    },
+    /// Sent from a newly connected client to the bootstrap node to prove that it is the owner of
+    /// the client's claimed public ID.
+    BootstrapRequest(sign::Signature),
+    /// Sent from the bootstrap node to a client in response to `BootstrapRequest`. If `true`,
+    /// bootstrapping is successful; if `false` the sender is not available as a bootstrap node.
+    BootstrapResponse(Result<(), BootstrapResponseError>),
     /// Sent from a node which is still joining the network to another node, to allow the latter to
     /// add the former to its routing table.
-    CandidateIdentify {
-        /// Keys and claimed name, serialised outside routing.
-        serialised_public_id: Vec<u8>,
-        /// Signature of the originator of this message.
-        signature: sign::Signature,
-        /// FIXME: Should be deprecated.
-        /// Tunnel connection indicator from sender which would override
-        /// intermediate peer_mgr states for routing table connection type.
-        /// Should not influence JoiningNode / Proxy states which are expected to be direct only.
-        is_tunnel: bool,
+    CandidateInfo {
+        /// `PublicId` from before relocation.
+        old_public_id: PublicId,
+        /// `PublicId` from after relocation.
+        new_public_id: PublicId,
+        /// Signature of concatenated `PublicId`s using the pre-relocation key.
+        signature_using_old: sign::Signature,
+        /// Signature of concatenated `PublicId`s and `signature_using_old` using the
+        /// post-relocation key.
+        signature_using_new: sign::Signature,
+        /// Client authority from after relocation.
+        new_client_auth: Authority<XorName>,
     },
     /// Sent from a node that needs a tunnel to be able to connect to the given peer.
-    TunnelRequest(PeerId),
+    TunnelRequest(PublicId),
     /// Sent as a response to `TunnelRequest` if the node can act as a tunnel.
-    TunnelSuccess(PeerId),
+    TunnelSuccess(PublicId),
+    /// Sent as a response to `TunnelSuccess` if the node is selected to act as a tunnel.
+    TunnelSelect(PublicId),
     /// Sent from a tunnel node to indicate that the given peer has disconnected.
-    TunnelClosed(PeerId),
+    TunnelClosed(PublicId),
     /// Sent to a tunnel node to indicate the tunnel is not needed any more.
-    TunnelDisconnect(PeerId),
-    /// Request a proof to be provided by the joining node
+    TunnelDisconnect(PublicId),
+    /// Request a proof to be provided by the joining node.
     ///
-    /// This is sent from member of Group Y to the joining node
+    /// This is sent from member of Group Y to the joining node.
     ResourceProof {
         /// seed of proof
         seed: Vec<u8>,
@@ -185,6 +168,8 @@ pub enum DirectMessage {
     },
     /// Receipt of a part of a ResourceProofResponse
     ResourceProofResponseReceipt,
+    /// Sent from a proxy node to its client to indicate that the client exceeded its rate limit.
+    ProxyRateLimitExceeded { ack: Ack },
 }
 
 impl DirectMessage {
@@ -217,18 +202,19 @@ pub struct HopMessage {
 
 impl HopMessage {
     /// Wrap `content` for transmission to the next hop and sign it.
-    pub fn new(content: SignedMessage,
-               route: u8,
-               sent_to: BTreeSet<XorName>,
-               signing_key: &sign::SecretKey)
-               -> Result<HopMessage, RoutingError> {
+    pub fn new(
+        content: SignedMessage,
+        route: u8,
+        sent_to: BTreeSet<XorName>,
+        signing_key: &sign::SecretKey,
+    ) -> Result<HopMessage, RoutingError> {
         let bytes_to_sign = serialise(&content)?;
         Ok(HopMessage {
-               content: content,
-               route: route,
-               sent_to: sent_to,
-               signature: sign::sign_detached(&bytes_to_sign, signing_key),
-           })
+            content: content,
+            route: route,
+            sent_to: sent_to,
+            signature: sign::sign_detached(&bytes_to_sign, signing_key),
+        })
     }
 
     /// Validate that the message is signed by `verification_key` contained in message.
@@ -285,17 +271,18 @@ impl SignedMessage {
     /// Creates a `SignedMessage` with the given `content` and signed by the given `full_id`.
     ///
     /// Requires the list `src_sections` of nodes who should sign this message.
-    pub fn new(content: RoutingMessage,
-               full_id: &FullId,
-               mut src_sections: Vec<SectionList>)
-               -> Result<SignedMessage, RoutingError> {
+    pub fn new(
+        content: RoutingMessage,
+        full_id: &FullId,
+        mut src_sections: Vec<SectionList>,
+    ) -> Result<SignedMessage, RoutingError> {
         src_sections.sort_by_key(|list| list.prefix);
         let sig = sign::sign_detached(&serialise(&content)?, full_id.signing_private_key());
         Ok(SignedMessage {
-               content: content,
-               src_sections: src_sections,
-               signatures: iter::once((*full_id.public_id(), sig)).collect(),
-           })
+            content: content,
+            src_sections: src_sections,
+            signatures: iter::once((*full_id.public_id(), sig)).collect(),
+        })
     }
 
     /// Confirms the signatures.
@@ -318,10 +305,7 @@ impl SignedMessage {
 
     /// Returns the number of nodes in the source authority.
     pub fn src_size(&self) -> usize {
-        self.src_sections
-            .iter()
-            .map(|sl| sl.pub_ids.len())
-            .sum()
+        self.src_sections.iter().map(|sl| sl.pub_ids.len()).sum()
     }
 
     /// Adds the given signature if it is new, without validating it. If the collection of section
@@ -385,9 +369,9 @@ impl SignedMessage {
 
     // Returns true iff `pub_id` is in self.section_lists
     fn is_sender(&self, pub_id: &PublicId) -> bool {
-        self.src_sections
-            .iter()
-            .any(|list| list.pub_ids.contains(pub_id))
+        self.src_sections.iter().any(
+            |list| list.pub_ids.contains(pub_id),
+        )
     }
 
     // Returns a list of all invalid signatures (not from an expected key or not cryptographically
@@ -397,12 +381,12 @@ impl SignedMessage {
             .iter()
             .filter_map(|(pub_id, sig)| {
                 // Remove if not in sending nodes or signature is invalid:
-                let is_valid = if let Authority::Client { ref client_key, .. } = self.content.src {
-                    client_key == pub_id.signing_public_key() &&
-                    sign::verify_detached(sig, &signed_bytes, client_key)
+                let is_valid = if let Authority::Client { ref client_id, .. } = self.content.src {
+                    client_id == pub_id &&
+                        sign::verify_detached(sig, &signed_bytes, client_id.signing_public_key())
                 } else {
                     self.is_sender(pub_id) &&
-                    sign::verify_detached(sig, &signed_bytes, pub_id.signing_public_key())
+                        sign::verify_detached(sig, &signed_bytes, pub_id.signing_public_key())
                 };
                 if is_valid { None } else { Some(*pub_id) }
             })
@@ -413,7 +397,7 @@ impl SignedMessage {
         invalid
     }
 
-    // Returns true iff there are enough signatures (note that this method does not verify the
+    // Returns true if there are enough signatures (note that this method does not verify the
     // signatures, it only counts them; it also does not verify `self.src_sections`).
     fn has_enough_sigs(&self, min_section_size: usize) -> bool {
         use Authority::*;
@@ -435,27 +419,25 @@ impl SignedMessage {
                 // cmp::min(routing_table.len(), min_section_size)
                 // (or just min_section_size, but in that case we will not be able to handle user
                 // messages during boot-up).
-                QUORUM * valid_names.len() <= 100 * valid_sigs
+                valid_sigs * QUORUM_DENOMINATOR > valid_names.len() * QUORUM_NUMERATOR
             }
             Section(_) => {
                 // Note: there should be exactly one source section, but we use safe code:
-                let num_sending = self.src_sections
-                    .iter()
-                    .fold(0, |count, list| count + list.pub_ids.len());
+                let num_sending = self.src_sections.iter().fold(0, |count, list| {
+                    count + list.pub_ids.len()
+                });
                 let valid_sigs = self.signatures.len();
-                QUORUM * num_sending <= 100 * valid_sigs
+                valid_sigs * QUORUM_DENOMINATOR > num_sending * QUORUM_NUMERATOR
             }
             PrefixSection(_) => {
                 // Each section must have enough signatures:
-                self.src_sections
-                    .iter()
-                    .all(|list| {
-                             let valid_sigs = self.signatures
-                                 .keys()
-                                 .filter(|pub_id| list.pub_ids.contains(pub_id))
-                                 .count();
-                             QUORUM * list.pub_ids.len() <= 100 * valid_sigs
-                         })
+                self.src_sections.iter().all(|list| {
+                    let valid_sigs = self.signatures
+                        .keys()
+                        .filter(|pub_id| list.pub_ids.contains(pub_id))
+                        .count();
+                    valid_sigs * QUORUM_DENOMINATOR > list.pub_ids.len() * QUORUM_NUMERATOR
+                })
             }
             ManagedNode(_) | Client { .. } => self.signatures.len() == 1,
         }
@@ -477,10 +459,10 @@ impl RoutingMessage {
     /// Create ack for the given message
     pub fn ack_from(msg: &RoutingMessage, src: Authority<XorName>) -> Result<Self, RoutingError> {
         Ok(RoutingMessage {
-               src: src,
-               dst: msg.src,
-               content: MessageContent::Ack(Ack::compute(msg)?, msg.priority()),
-           })
+            src: src,
+            dst: msg.src,
+            content: MessageContent::Ack(Ack::compute(msg)?, msg.priority()),
+        })
     }
 
     /// Returns the priority Crust should send this message with.
@@ -489,11 +471,12 @@ impl RoutingMessage {
     }
 
     /// Returns a `DirectMessage::MessageSignature` for this message.
-    pub fn to_signature(&self,
-                        signing_key: &sign::SecretKey)
-                        -> Result<DirectMessage, RoutingError> {
+    pub fn to_signature(
+        &self,
+        signing_key: &sign::SecretKey,
+    ) -> Result<DirectMessage, RoutingError> {
         let serialised_msg = serialise(self)?;
-        let hash = sha256::hash(&serialised_msg);
+        let hash = sha3_256(&serialised_msg);
         let sig = sign::sign_detached(&serialised_msg, signing_key);
         Ok(DirectMessage::MessageSignature(hash, sig))
     }
@@ -507,12 +490,12 @@ impl RoutingMessage {
 /// ## Bootstrapping a client
 ///
 /// A newly created `Core`, A, starts in `Disconnected` state and tries to establish a connection to
-/// any node B of the network via Crust. When successful, i. e. when receiving an `OnConnect` event,
+/// any node B of the network via Crust. When successful, i.e. when receiving an `OnConnect` event,
 /// it moves to the `Bootstrapping` state.
 ///
-/// A now sends a `ClientIdentify` message to B, containing A's signed public ID. B verifies the
-/// signature and responds with a `BootstrapIdentify`, containing B's public ID. Once it receives
-/// that, A goes into the `Client` state and uses B as its proxy to the network.
+/// A now sends a `BootstrapRequest` message to B, containing the signature of A's public ID. B
+/// responds with a `BootstrapResponse`, indicating success or failure. Once it receives that, A
+/// goes into the `Client` state and uses B as its proxy to the network.
 ///
 /// A can now exchange messages with any `Authority`. This completes the bootstrap process for
 /// clients.
@@ -525,13 +508,17 @@ impl RoutingMessage {
 /// table and get added to their routing tables.
 ///
 ///
-/// ### Getting a new network name from the `NaeManager`
+/// ### Relocating on the network
 ///
-/// Once in `Client` state, A sends a `GetNodeName` request to the `NaeManager` section authority X
-/// of A's current name. X computes a new name and sends it in an `ExpectCandidate` request to the
-/// `NaeManager` Y of A's new name. Each member of Y caches A's public ID, and sends
-/// `AcceptAsCandidate` to self section. Once Y receives `AcceptAsCandidate`, sends a `GetNodeName`
-/// response back to A, which includes the public IDs of the members of Y.
+/// Once in `JoiningNode` state, A sends a `Relocate` request to the `NaeManager` section authority
+/// X of A's current name. X computes a target destination Y to which A should relocate and sends
+/// that section's `NaeManager`s an `ExpectCandidate` containing A's current public ID. Each member
+/// of Y caches A's public ID, and sends `AcceptAsCandidate` to self section. Once Y receives
+/// `AcceptAsCandidate`, sends a `RelocateResponse` back to A, which includes an address space range
+/// into which A should relocate and also the public IDs of the members of Y. A then disconnects
+/// from the network and reconnects with a new ID which falls within the specified address range.
+/// After connecting to the members of Y, it begins the resource proof process. Upon successful
+/// completion, A is regarded as a full node and connects to all neighbouring sections' peers.
 ///
 ///
 /// ### Connecting to the matching section
@@ -544,12 +531,9 @@ impl RoutingMessage {
 /// to A and also attempts to connect to A via Crust. A does the same, once it receives the
 /// `ConnectionInfo`.
 ///
-/// Once the connection between A and Z is established and a Crust `OnConnect` event is raised,
-/// they exchange `NodeIdentify` messages.
-///
 ///
 /// ### Resource Proof Evaluation to approve
-/// When nodes Z of section Y receive `NodeIdentify` from A, they respond with a `ResourceProof`
+/// When nodes Z of section Y receive `CandidateInfo` from A, they reply with a `ResourceProof`
 /// request. Node A needs to answer these requests (resolving a hashing challenge) with
 /// `ResourceProofResponse`. Members of Y will send out `CandidateApproval` messages to vote for the
 /// approval in their section. Once the vote succeeds, the members of Y send `NodeApproval` to A and
@@ -558,25 +542,23 @@ impl RoutingMessage {
 ///
 #[derive(Ord, PartialOrd, Eq, PartialEq, Clone, Hash, Serialize, Deserialize)]
 // FIXME - See https://maidsafe.atlassian.net/browse/MAID-2026 for info on removing this exclusion.
-#[cfg_attr(feature="cargo-clippy", allow(large_enum_variant))]
+#[cfg_attr(feature = "cargo-clippy", allow(large_enum_variant))]
 pub enum MessageContent {
     // ---------- Internal ------------
-    /// Ask the network to alter your `PublicId` name.
+    /// Ask the network to relocate you.
     ///
-    /// This is sent by a `Client` to its `NaeManager` with the intent to become a routing node with
-    /// a new name chosen by the `NaeManager`.
-    GetNodeName {
-        /// The client's `PublicId` (public keys and name)
-        current_id: PublicId,
+    /// This is sent by a joining node to its `NaeManager`s with the intent to become a full routing
+    /// node with a new ID in an address range chosen by the `NaeManager`s.
+    Relocate {
         /// The message's unique identifier.
         message_id: MessageId,
     },
-    /// Notify a joining node's `NaeManager` so that it sends a `GetNodeNameResponse`.
+    /// Notify a joining node's `NaeManager` so that it sends a `RelocateResponse`.
     ExpectCandidate {
-        /// The joining node's `PublicId` (public keys and name)
-        expect_id: PublicId,
-        /// The client's current authority.
-        client_auth: Authority<XorName>,
+        /// The joining node's current public ID.
+        old_public_id: PublicId,
+        /// The joining node's current authority.
+        old_client_auth: Authority<XorName>,
         /// The message's unique identifier.
         message_id: MessageId,
     },
@@ -604,49 +586,26 @@ pub enum MessageContent {
         /// The message's unique identifier.
         msg_id: MessageId,
     },
-    /// Reply with the new `PublicId` for the joining node.
-    ///
-    /// Sent from the `NodeManager` to the `Client`.
-    GetNodeNameResponse {
-        /// Supplied `PublicId`, but with the new name
-        relocated_id: PublicId,
-        /// The relocated section that the joining node shall connect to
-        section: BTreeSet<PublicId>,
+    /// Reply with the address range into which the joining node should move.
+    RelocateResponse {
+        /// The interval into which the joining node should join.
+        target_interval: (XorName, XorName),
+        /// The section that the joining node shall connect to.
+        section: (Prefix<XorName>, BTreeSet<PublicId>),
         /// The message's unique identifier.
         message_id: MessageId,
-    },
-    /// Sent to request a `SectionUpdate` from a neighbouring section. Only sent if we receive a
-    /// message from that section indicating its section prefix has altered while we've been in the
-    /// process of handling a merge ourself.
-    SectionUpdateRequest {
-        /// Section prefix of the sender. Included as the message is sent from a `ManagedNode`, but
-        /// the response should be sent to `PrefixSection` indicated by `our_prefix`.
-        our_prefix: Prefix<XorName>,
     },
     /// Sent to notify neighbours and own members when our section's member list changed (for now,
     /// only when new nodes join).
     SectionUpdate {
-        /// Section prefix. Included because this message is sent to both the section's own members
-        /// and neighbouring sections.
-        prefix: Prefix<XorName>,
+        /// Section prefix and version. Included because this message is sent to both the section's
+        /// own members and neighbouring sections.
+        versioned_prefix: VersionedPrefix<XorName>,
         /// Members of the section
         members: BTreeSet<PublicId>,
-        /// Whether the recipient should process merges implied by this update.
-        merge: bool,
-    },
-    /// Sent from a node to its own section to request their current routing table.
-    RoutingTableRequest(MessageId, sha256::Digest),
-    /// Sent from a section to a node to update it about its prefix and its member list.
-    RoutingTableResponse {
-        /// The section's current prefix.
-        prefix: Prefix<XorName>,
-        /// Members of the section.
-        members: BTreeSet<PublicId>,
-        /// The message's unique identifier.
-        message_id: MessageId,
     },
     /// Sent to all connected peers when our own section splits
-    SectionSplit(Prefix<XorName>, XorName),
+    SectionSplit(VersionedPrefix<XorName>, XorName),
     /// Sent amongst members of a newly-merged section to allow synchronisation of their routing
     /// tables before notifying other connected peers of the merge.
     ///
@@ -656,15 +615,18 @@ pub enum MessageContent {
     /// Sent by members of a newly-merged section to peers outwith the merged section to notify them
     /// of the merge.
     ///
-    /// The source authority is a `PrefixSection` conveying the section which just merged.
-    OtherSectionMerge(BTreeSet<PublicId>),
+    /// The source authority is a `PrefixSection` conveying the section which just merged. The
+    /// first field is the set of members of the section, and the second is the section version.
+    OtherSectionMerge(BTreeSet<PublicId>, u64),
     /// Acknowledge receipt of any message except an `Ack`. It contains the hash of the
     /// received message and the priority.
     Ack(Ack, u8),
     /// Part of a user-facing message
     UserMessagePart {
         /// The hash of this user message.
-        hash: sha3::Digest256,
+        hash: Digest256,
+        /// The unique message ID of this user message.
+        msg_id: MessageId,
         /// The number of parts.
         part_count: u32,
         /// The index of this part.
@@ -680,19 +642,21 @@ pub enum MessageContent {
     ///
     /// Sent from the `NaeManager` to the `NaeManager`.
     AcceptAsCandidate {
-        /// Supplied `PublicId`, but with the new name
-        expect_id: PublicId,
-        /// Client authority of the candidate
-        client_auth: Authority<XorName>,
+        /// The joining node's current public ID.
+        old_public_id: PublicId,
+        /// The joining node's current authority.
+        old_client_auth: Authority<XorName>,
+        /// The interval into which the joining node should join.
+        target_interval: (XorName, XorName),
         /// The message's unique identifier.
         message_id: MessageId,
     },
     /// Sent among Group Y to vote to accept a joining node.
     CandidateApproval {
-        /// The `PublicId` of the candidate
-        candidate_id: PublicId,
-        /// Client authority of the candidate
-        client_auth: Authority<XorName>,
+        /// The joining node's current public ID.
+        new_public_id: PublicId,
+        /// Client authority of the candidate.
+        new_client_auth: Authority<XorName>,
         /// The `PublicId`s of all routing table contacts shared by the nodes in our section.
         sections: SectionMap,
     },
@@ -722,39 +686,35 @@ impl Debug for DirectMessage {
         use self::DirectMessage::*;
         match *self {
             MessageSignature(ref digest, _) => {
-                write!(formatter,
-                       "MessageSignature ({}, ..)",
-                       utils::format_binary_array(&digest.0))
+                write!(
+                    formatter,
+                    "MessageSignature ({}, ..)",
+                    utils::format_binary_array(&digest)
+                )
             }
             SectionListSignature(ref sec_list, _) => {
                 write!(formatter, "SectionListSignature({:?}, ..)", sec_list.prefix)
             }
-            BootstrapIdentify { ref public_id } => {
-                write!(formatter, "BootstrapIdentify {{ {:?} }}", public_id)
-            }
-            BootstrapDeny => write!(formatter, "BootstrapDeny"),
-            ClientIdentify { client_restriction: true, .. } => {
-                write!(formatter, "ClientIdentify (client only)")
-            }
-            ClientIdentify { client_restriction: false, .. } => {
-                write!(formatter, "ClientIdentify (joining node)")
-            }
-            NodeIdentify { .. } => write!(formatter, "NodeIdentify {{ .. }}"),
-            CandidateIdentify { .. } => write!(formatter, "CandidateIdentify {{ .. }}"),
-            TunnelRequest(peer_id) => write!(formatter, "TunnelRequest({:?})", peer_id),
-            TunnelSuccess(peer_id) => write!(formatter, "TunnelSuccess({:?})", peer_id),
-            TunnelClosed(peer_id) => write!(formatter, "TunnelClosed({:?})", peer_id),
-            TunnelDisconnect(peer_id) => write!(formatter, "TunnelDisconnect({:?})", peer_id),
+            BootstrapRequest(_) => write!(formatter, "BootstrapRequest"),
+            BootstrapResponse(ref result) => write!(formatter, "BootstrapResponse({:?})", result),
+            CandidateInfo { .. } => write!(formatter, "CandidateInfo {{ .. }}"),
+            TunnelRequest(pub_id) => write!(formatter, "TunnelRequest({:?})", pub_id),
+            TunnelSuccess(pub_id) => write!(formatter, "TunnelSuccess({:?})", pub_id),
+            TunnelSelect(pub_id) => write!(formatter, "TunnelSelect({:?})", pub_id),
+            TunnelClosed(pub_id) => write!(formatter, "TunnelClosed({:?})", pub_id),
+            TunnelDisconnect(pub_id) => write!(formatter, "TunnelDisconnect({:?})", pub_id),
             ResourceProof {
                 ref seed,
                 ref target_size,
                 ref difficulty,
             } => {
-                write!(formatter,
-                       "ResourceProof {{ seed: {:?}, target_size: {:?}, difficulty: {:?} }}",
-                       seed,
-                       target_size,
-                       difficulty)
+                write!(
+                    formatter,
+                    "ResourceProof {{ seed: {:?}, target_size: {:?}, difficulty: {:?} }}",
+                    seed,
+                    target_size,
+                    difficulty
+                )
             }
             ResourceProofResponse {
                 part_index,
@@ -762,35 +722,44 @@ impl Debug for DirectMessage {
                 ref proof,
                 leading_zero_bytes,
             } => {
-                write!(formatter,
-                       "ResourceProofResponse {{ part {}/{}, proof_len: {:?}, leading_zero_bytes: \
+                write!(
+                    formatter,
+                    "ResourceProofResponse {{ part {}/{}, proof_len: {:?}, leading_zero_bytes: \
                         {:?} }}",
-                       part_index + 1,
-                       part_count,
-                       proof.len(),
-                       leading_zero_bytes)
+                    part_index + 1,
+                    part_count,
+                    proof.len(),
+                    leading_zero_bytes
+                )
             }
             ResourceProofResponseReceipt => write!(formatter, "ResourceProofResponseReceipt"),
+            ProxyRateLimitExceeded { ref ack } => {
+                write!(formatter, "ProxyRateLimitExceeded({:?})", ack)
+            }
         }
     }
 }
 
 impl Debug for HopMessage {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
-        write!(formatter,
-               "HopMessage {{ content: {:?}, route: {}, sent_to: .., signature: .. }}",
-               self.content,
-               self.route)
+        write!(
+            formatter,
+            "HopMessage {{ content: {:?}, route: {}, sent_to: .., signature: .. }}",
+            self.content,
+            self.route
+        )
     }
 }
 
 impl Debug for SignedMessage {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
-        write!(formatter,
-               "SignedMessage {{ content: {:?}, sending nodes: {:?}, signatures: {:?} }}",
-               self.content,
-               self.src_sections,
-               self.signatures.keys().collect_vec())
+        write!(
+            formatter,
+            "SignedMessage {{ content: {:?}, sending nodes: {:?}, signatures: {:?} }}",
+            self.content,
+            self.src_sections,
+            self.signatures.keys().collect_vec()
+        )
     }
 }
 
@@ -798,93 +767,75 @@ impl Debug for MessageContent {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
         use self::MessageContent::*;
         match *self {
-            GetNodeName {
-                ref current_id,
-                ref message_id,
-            } => {
-                write!(formatter,
-                       "GetNodeName {{ {:?}, {:?} }}",
-                       current_id,
-                       message_id)
-            }
+            Relocate { ref message_id } => write!(formatter, "Relocate {{ {:?} }}", message_id),
             ExpectCandidate {
-                ref expect_id,
-                ref client_auth,
+                ref old_public_id,
+                ref old_client_auth,
                 ref message_id,
             } => {
-                write!(formatter,
-                       "ExpectCandidate {{ {:?}, {:?}, {:?} }}",
-                       expect_id,
-                       client_auth,
-                       message_id)
+                write!(
+                    formatter,
+                    "ExpectCandidate {{ {:?}, {:?}, {:?} }}",
+                    old_public_id,
+                    old_client_auth,
+                    message_id
+                )
             }
             ConnectionInfoRequest {
                 ref pub_id,
                 ref msg_id,
                 ..
             } => {
-                write!(formatter,
-                       "ConnectionInfoRequest {{ {:?}, {:?}, .. }}",
-                       pub_id,
-                       msg_id)
+                write!(
+                    formatter,
+                    "ConnectionInfoRequest {{ {:?}, {:?}, .. }}",
+                    pub_id,
+                    msg_id
+                )
             }
             ConnectionInfoResponse {
                 ref pub_id,
                 ref msg_id,
                 ..
             } => {
-                write!(formatter,
-                       "ConnectionInfoResponse {{ {:?}, {:?}, .. }}",
-                       pub_id,
-                       msg_id)
+                write!(
+                    formatter,
+                    "ConnectionInfoResponse {{ {:?}, {:?}, .. }}",
+                    pub_id,
+                    msg_id
+                )
             }
-            GetNodeNameResponse {
-                ref relocated_id,
+            RelocateResponse {
+                ref target_interval,
                 ref section,
                 ref message_id,
             } => {
-                write!(formatter,
-                       "GetNodeNameResponse {{ {:?}, {:?}, {:?} }}",
-                       relocated_id,
-                       section,
-                       message_id)
-            }
-            SectionUpdateRequest { ref our_prefix } => {
-                write!(formatter, "SectionUpdateRequest {{ {:?} }}", our_prefix)
+                write!(
+                    formatter,
+                    "RelocateResponse {{ {:?}, {:?}, {:?} }}",
+                    target_interval,
+                    section,
+                    message_id
+                )
             }
             SectionUpdate {
-                ref prefix,
+                ref versioned_prefix,
                 ref members,
-                ref merge,
             } => {
-                write!(formatter,
-                       "SectionUpdate {{ {:?}, {:?}, {:?} }}",
-                       prefix,
-                       members,
-                       merge)
+                write!(
+                    formatter,
+                    "SectionUpdate {{ {:?}, {:?} }}",
+                    versioned_prefix,
+                    members
+                )
             }
-            RoutingTableRequest(ref msg_id, ref digest) => {
-                write!(formatter,
-                       "RoutingTableRequest({:?}, {})",
-                       msg_id,
-                       utils::format_binary_array(&digest.0))
-            }
-            RoutingTableResponse {
-                ref prefix,
-                ref members,
-                ref message_id,
-            } => {
-                write!(formatter,
-                       "RoutingTableResponse {{ {:?}, {:?}, {:?} }}",
-                       prefix,
-                       members,
-                       message_id)
-            }
-            SectionSplit(ref prefix, ref joining_node) => {
-                write!(formatter, "SectionSplit({:?}, {:?})", prefix, joining_node)
+            SectionSplit(ref ver_pfx, ref joining_node) => {
+                write!(formatter, "SectionSplit({:?}, {:?})", ver_pfx, joining_node)
             }
             OwnSectionMerge(ref sections) => write!(formatter, "OwnSectionMerge({:?})", sections),
-            OtherSectionMerge(ref section) => write!(formatter, "OtherSectionMerge({:?})", section),
+            OtherSectionMerge(ref section, ref version) => {
+                write!(formatter, "OtherSectionMerge({:?}, {:?})", section, version)
+            }
             Ack(ack, priority) => write!(formatter, "Ack({:?}, {})", ack, priority),
             UserMessagePart {
                 hash,
@@ -894,39 +845,46 @@ impl Debug for MessageContent {
                 cacheable,
                 ..
             } => {
-                write!(formatter,
-                       "UserMessagePart {{ {}/{}, priority: {}, cacheable: {}, \
+                write!(
+                    formatter,
+                    "UserMessagePart {{ {}/{}, priority: {}, cacheable: {}, \
                         {:02x}{:02x}{:02x}.. }}",
-                       part_index + 1,
-                       part_count,
-                       priority,
-                       cacheable,
-                       hash[0],
-                       hash[1],
-                       hash[2])
+                    part_index + 1,
+                    part_count,
+                    priority,
+                    cacheable,
+                    hash[0],
+                    hash[1],
+                    hash[2]
+                )
             }
             AcceptAsCandidate {
-                ref expect_id,
-                ref client_auth,
+                ref old_public_id,
+                ref old_client_auth,
+                ref target_interval,
                 ref message_id,
             } => {
-                write!(formatter,
-                       "AcceptAsCandidate {{ {:?}, {:?}, {:?} }}",
-                       expect_id,
-                       client_auth,
-                       message_id)
+                write!(
+                    formatter,
+                    "AcceptAsCandidate {{ {:?}, {:?}, {:?}, {:?} }}",
+                    old_public_id,
+                    old_client_auth,
+                    target_interval,
+                    message_id
+                )
             }
             CandidateApproval {
-                ref candidate_id,
-                ref client_auth,
+                ref new_public_id,
+                ref new_client_auth,
                 ref sections,
             } => {
-                write!(formatter,
-                       "CandidateApproval {{ candidate_id: {:?}, client_auth: {:?}, sections: \
-                        {:?} }}",
-                       candidate_id,
-                       client_auth,
-                       sections)
+                write!(
+                    formatter,
+                    "CandidateApproval {{ new: {:?}, client: {:?}, sections: {:?} }}",
+                    new_public_id,
+                    new_client_auth,
+                    sections
+                )
             }
             NodeApproval { ref sections } => write!(formatter, "NodeApproval {{ {:?} }}", sections),
         }
@@ -948,28 +906,34 @@ impl UserMessage {
     pub fn to_parts(&self, priority: u8) -> Result<Vec<MessageContent>, RoutingError> {
         let payload = serialise(self)?;
         let hash = sha3_256(&payload);
+        let msg_id = *self.message_id();
         let len = payload.len();
         let part_count = (len + MAX_PART_LEN - 1) / MAX_PART_LEN;
 
-        Ok((0..part_count)
-               .map(|i| {
-            MessageContent::UserMessagePart {
-                hash: hash,
-                part_count: part_count as u32,
-                part_index: i as u32,
-                cacheable: self.is_cacheable(),
-                payload: payload[(i * len / part_count)..((i + 1) * len / part_count)].to_vec(),
-                priority: priority,
-            }
-        })
-               .collect())
+        Ok(
+            (0..part_count)
+                .map(|i| {
+                    MessageContent::UserMessagePart {
+                        hash,
+                        msg_id,
+                        part_count: part_count as u32,
+                        part_index: i as u32,
+                        cacheable: self.is_cacheable(),
+                        payload: payload[(i * len / part_count)..((i + 1) * len / part_count)]
+                            .to_vec(),
+                        priority,
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// Puts the given parts of a serialised message together and verifies that it matches the
     /// given hash code. If it does, returns the `UserMessage`.
-    pub fn from_parts<'a, I: Iterator<Item = &'a Vec<u8>>>(hash: sha3::Digest256,
-                                                           parts: I)
-                                                           -> Result<UserMessage, RoutingError> {
+    pub fn from_parts<'a, I: Iterator<Item = &'a Vec<u8>>>(
+        hash: Digest256,
+        parts: I,
+    ) -> Result<UserMessage, RoutingError> {
         let mut payload = Vec::new();
         for part in parts {
             payload.extend_from_slice(part);
@@ -1003,6 +967,14 @@ impl UserMessage {
         }
     }
 
+    /// The unique message ID of this `UserMessage`.
+    pub fn message_id(&self) -> &MessageId {
+        match *self {
+            UserMessage::Request(ref request) => request.message_id(),
+            UserMessage::Response(ref response) => response.message_id(),
+        }
+    }
+
     fn is_cacheable(&self) -> bool {
         match *self {
             UserMessage::Request(ref request) => request.is_cacheable(),
@@ -1011,257 +983,10 @@ impl UserMessage {
     }
 }
 
-/// Request message types
-#[derive(Ord, PartialOrd, Eq, PartialEq, Clone, Hash, Serialize, Deserialize)]
-// FIXME - See https://maidsafe.atlassian.net/browse/MAID-2026 for info on removing this exclusion.
-#[cfg_attr(feature="cargo-clippy", allow(large_enum_variant))]
-pub enum Request {
-    /// Message from upper layers sending network state on any network churn event.
-    Refresh(Vec<u8>, MessageId),
-    /// Ask for data from network, passed from API with data name as parameter
-    Get(DataIdentifier, MessageId),
-    /// Put data to network. Provide actual data as parameter
-    Put(Data, MessageId),
-    /// Post data to network. Provide actual data as parameter
-    Post(Data, MessageId),
-    /// Delete data from network. Provide actual data as parameter
-    Delete(Data, MessageId),
-    /// Append an item to an appendable data chunk.
-    Append(AppendWrapper, MessageId),
-    /// Get account information for Client with given ID
-    GetAccountInfo(MessageId),
-}
-
-/// Response message types
-#[derive(Ord, PartialOrd, Eq, PartialEq, Clone, Hash, Serialize, Deserialize)]
-pub enum Response {
-    /// Reply with the requested data (may not be ignored)
-    ///
-    /// Sent from a `ManagedNode` to an `NaeManager`, and from there to a `Client`, although this
-    /// may be shortcut if the data is in a node's cache.
-    GetSuccess(Data, MessageId),
-    /// Success token for Put (may be ignored)
-    PutSuccess(DataIdentifier, MessageId),
-    /// Success token for Post (may be ignored)
-    PostSuccess(DataIdentifier, MessageId),
-    /// Success token for delete (may be ignored)
-    DeleteSuccess(DataIdentifier, MessageId),
-    /// Success token for append (may be ignored)
-    AppendSuccess(DataIdentifier, MessageId),
-    /// Response containing account information for requested Client account
-    GetAccountInfoSuccess {
-        /// Unique message identifier
-        id: MessageId,
-        /// Amount of data stored on the network by this Client
-        data_stored: u64,
-        /// Amount of network space available to this Client
-        space_available: u64,
-    },
-    /// Error for `Get`, includes signed request to prevent injection attacks
-    GetFailure {
-        /// Unique message identifier
-        id: MessageId,
-        /// ID of the affected data chunk
-        data_id: DataIdentifier,
-        /// Error type sent back, may be injected from upper layers
-        external_error_indicator: Vec<u8>,
-    },
-    /// Error for Put, includes signed request to prevent injection attacks
-    PutFailure {
-        /// Unique message identifier
-        id: MessageId,
-        /// ID of the affected data chunk
-        data_id: DataIdentifier,
-        /// Error type sent back, may be injected from upper layers
-        external_error_indicator: Vec<u8>,
-    },
-    /// Error for Post, includes signed request to prevent injection attacks
-    PostFailure {
-        /// Unique message identifier
-        id: MessageId,
-        /// ID of the affected data chunk
-        data_id: DataIdentifier,
-        /// Error type sent back, may be injected from upper layers
-        external_error_indicator: Vec<u8>,
-    },
-    /// Error for delete, includes signed request to prevent injection attacks
-    DeleteFailure {
-        /// Unique message identifier
-        id: MessageId,
-        /// ID of the affected data chunk
-        data_id: DataIdentifier,
-        /// Error type sent back, may be injected from upper layers
-        external_error_indicator: Vec<u8>,
-    },
-    /// Error for append, includes signed request to prevent injection attacks
-    AppendFailure {
-        /// Unique message identifier
-        id: MessageId,
-        /// ID of the affected data chunk
-        data_id: DataIdentifier,
-        /// Error type sent back, may be injected from upper layers
-        external_error_indicator: Vec<u8>,
-    },
-    /// Error for `GetAccountInfo`
-    GetAccountInfoFailure {
-        /// Unique message identifier
-        id: MessageId,
-        /// Error type sent back, may be injected from upper layers
-        external_error_indicator: Vec<u8>,
-    },
-}
-
-impl Request {
-    /// The priority Crust should send this message with.
-    pub fn priority(&self) -> u8 {
-        match *self {
-            Request::Refresh(..) => 2,
-            Request::Get(..) |
-            Request::GetAccountInfo(..) => 3,
-            Request::Append(..) => 4,
-            Request::Put(ref data, _) |
-            Request::Post(ref data, _) |
-            Request::Delete(ref data, _) => {
-                match *data {
-                    Data::Structured(..) => 4,
-                    _ => 5,
-                }
-            }
-        }
-    }
-
-    /// Is the response corresponding to this request cacheable?
-    pub fn is_cacheable(&self) -> bool {
-        if let Request::Get(DataIdentifier::Immutable(..), _) = *self {
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl Response {
-    /// The priority Crust should send this message with.
-    pub fn priority(&self) -> u8 {
-        match *self {
-            Response::GetSuccess(ref data, _) => {
-                match *data {
-                    Data::Structured(..) => 4,
-                    _ => 5,
-                }
-            }
-            Response::PutSuccess(..) |
-            Response::PostSuccess(..) |
-            Response::DeleteSuccess(..) |
-            Response::AppendSuccess(..) |
-            Response::GetAccountInfoSuccess { .. } |
-            Response::GetFailure { .. } |
-            Response::PutFailure { .. } |
-            Response::PostFailure { .. } |
-            Response::DeleteFailure { .. } |
-            Response::AppendFailure { .. } |
-            Response::GetAccountInfoFailure { .. } => 3,
-        }
-    }
-
-    /// Is this response cacheable?
-    pub fn is_cacheable(&self) -> bool {
-        if let Response::GetSuccess(Data::Immutable(..), _) = *self {
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl Debug for Request {
-    fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
-        match *self {
-            Request::Refresh(ref data, ref message_id) => {
-                write!(formatter,
-                       "Refresh({}, {:?})",
-                       utils::format_binary_array(data),
-                       message_id)
-            }
-            Request::Get(ref data_request, ref message_id) => {
-                write!(formatter, "Get({:?}, {:?})", data_request, message_id)
-            }
-            Request::Put(ref data, ref message_id) => {
-                write!(formatter, "Put({:?}, {:?})", data, message_id)
-            }
-            Request::Post(ref data, ref message_id) => {
-                write!(formatter, "Post({:?}, {:?})", data, message_id)
-            }
-            Request::Delete(ref data, ref message_id) => {
-                write!(formatter, "Delete({:?}, {:?})", data, message_id)
-            }
-            Request::Append(ref wrapper, ref message_id) => {
-                write!(formatter, "Append({:?}, {:?})", wrapper, message_id)
-            }
-            Request::GetAccountInfo(ref message_id) => {
-                write!(formatter, "GetAccountInfo({:?})", message_id)
-            }
-        }
-    }
-}
-
-impl Debug for Response {
-    fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
-        match *self {
-            Response::GetSuccess(ref data, ref message_id) => {
-                write!(formatter, "GetSuccess({:?}, {:?})", data, message_id)
-            }
-            Response::PutSuccess(ref name, ref message_id) => {
-                write!(formatter, "PutSuccess({:?}, {:?})", name, message_id)
-            }
-            Response::PostSuccess(ref name, ref message_id) => {
-                write!(formatter, "PostSuccess({:?}, {:?})", name, message_id)
-            }
-            Response::DeleteSuccess(ref name, ref message_id) => {
-                write!(formatter, "DeleteSuccess({:?}, {:?})", name, message_id)
-            }
-            Response::AppendSuccess(ref name, ref message_id) => {
-                write!(formatter, "AppendSuccess({:?}, {:?})", name, message_id)
-            }
-            Response::GetAccountInfoSuccess { ref id, .. } => {
-                write!(formatter, "GetAccountInfoSuccess {{ {:?}, .. }}", id)
-            }
-            Response::GetFailure {
-                ref id,
-                ref data_id,
-                ..
-            } => write!(formatter, "GetFailure {{ {:?}, {:?}, .. }}", id, data_id),
-            Response::PutFailure {
-                ref id,
-                ref data_id,
-                ..
-            } => write!(formatter, "PutFailure {{ {:?}, {:?}, .. }}", id, data_id),
-            Response::PostFailure {
-                ref id,
-                ref data_id,
-                ..
-            } => write!(formatter, "PostFailure {{ {:?}, {:?}, .. }}", id, data_id),
-            Response::DeleteFailure {
-                ref id,
-                ref data_id,
-                ..
-            } => write!(formatter, "DeleteFailure {{ {:?}, {:?}, .. }}", id, data_id),
-            Response::AppendFailure {
-                ref id,
-                ref data_id,
-                ..
-            } => write!(formatter, "AppendFailure {{ {:?}, {:?}, .. }}", id, data_id),
-            Response::GetAccountInfoFailure { ref id, .. } => {
-                write!(formatter, "GetAccountInfoFailure {{ {:?}, .. }}", id)
-            }
-        }
-    }
-}
-
 /// This assembles `UserMessage`s from `UserMessagePart`s.
 /// It maps `(hash, part_count)` of an incoming `UserMessage` to the map containing
 /// all `UserMessagePart`s that have already arrived, by `part_index`.
-pub struct UserMessageCache(LruCache<(sha3::Digest256, u32), BTreeMap<u32, Vec<u8>>>);
+pub struct UserMessageCache(LruCache<(Digest256, u32), BTreeMap<u32, Vec<u8>>>);
 
 impl UserMessageCache {
     pub fn with_expiry_duration(duration: Duration) -> Self {
@@ -1270,24 +995,27 @@ impl UserMessageCache {
 
     /// Adds the given one to the cache of received message parts, returning a `UserMessage` if the
     /// given part was the last missing piece of it.
-    pub fn add(&mut self,
-               hash: sha3::Digest256,
-               part_count: u32,
-               part_index: u32,
-               payload: Vec<u8>)
-               -> Option<UserMessage> {
+    pub fn add(
+        &mut self,
+        hash: Digest256,
+        part_count: u32,
+        part_index: u32,
+        payload: Vec<u8>,
+    ) -> Option<UserMessage> {
         {
-            let entry = self.0
-                .entry((hash, part_count))
-                .or_insert_with(BTreeMap::new);
+            let entry = self.0.entry((hash, part_count)).or_insert_with(
+                BTreeMap::new,
+            );
             if entry.insert(part_index, payload).is_some() {
-                debug!("Duplicate UserMessagePart {}/{} with hash {:02x}{:02x}{:02x}.. \
+                debug!(
+                    "Duplicate UserMessagePart {}/{} with hash {:02x}{:02x}{:02x}.. \
                         added to cache.",
-                       part_index + 1,
-                       part_count,
-                       hash[0],
-                       hash[1],
-                       hash[2]);
+                    part_index + 1,
+                    part_count,
+                    hash[0],
+                    hash[1],
+                    hash[2]
+                );
             }
 
             if entry.len() != part_count as usize {
@@ -1295,41 +1023,26 @@ impl UserMessageCache {
             }
         }
 
-        self.0
-            .remove(&(hash, part_count))
-            .and_then(|part_map| UserMessage::from_parts(hash, part_map.values()).ok())
+        self.0.remove(&(hash, part_count)).and_then(|part_map| {
+            UserMessage::from_parts(hash, part_map.values()).ok()
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    #[cfg(not(feature = "use-mock-crust"))]
-    use crust::PeerId;
-    use data::{Data, ImmutableData};
+    use data::ImmutableData;
     use id::FullId;
     use maidsafe_utilities::serialisation::serialise;
-    #[cfg(feature = "use-mock-crust")]
-    use mock_crust::crust::PeerId;
     use rand;
     use routing_table::{Authority, Prefix};
-    use rust_sodium::crypto::hash::sha256;
     use rust_sodium::crypto::sign;
     use std::collections::BTreeSet;
     use std::iter;
     use tiny_keccak::sha3_256;
     use types::MessageId;
     use xor_name::XorName;
-
-    #[cfg(not(feature = "use-mock-crust"))]
-    fn make_peer_id() -> PeerId {
-        PeerId(*FullId::new().public_id().encrypting_public_key())
-    }
-    #[cfg(feature = "use-mock-crust")]
-    fn make_peer_id() -> PeerId {
-        PeerId(0)
-    }
 
     #[test]
     fn signed_message_check_integrity() {
@@ -1338,12 +1051,11 @@ mod tests {
         let full_id = FullId::new();
         let routing_message = RoutingMessage {
             src: Authority::Client {
-                client_key: *full_id.public_id().signing_public_key(),
-                peer_id: make_peer_id(),
+                client_id: *full_id.public_id(),
                 proxy_node_name: name,
             },
             dst: Authority::ClientManager(name),
-            content: MessageContent::SectionSplit(Prefix::new(0, name), name),
+            content: MessageContent::SectionSplit(Prefix::new(0, name).with_version(0), name),
         };
         let senders = iter::empty().collect();
         let signed_message_result = SignedMessage::new(routing_message.clone(), &full_id, senders);
@@ -1352,8 +1064,10 @@ mod tests {
 
         assert_eq!(routing_message, *signed_message.routing_message());
         assert_eq!(1, signed_message.signatures.len());
-        assert_eq!(Some(full_id.public_id()),
-                   signed_message.signatures.keys().next());
+        assert_eq!(
+            Some(full_id.public_id()),
+            signed_message.signatures.keys().next()
+        );
 
         unwrap!(signed_message.check_integrity(min_section_size));
 
@@ -1379,8 +1093,11 @@ mod tests {
         let full_id_2 = FullId::new();
         let irrelevant_full_id = FullId::new();
         let data_bytes: Vec<u8> = (0..10).map(|i| i as u8).collect();
-        let data = Data::Immutable(ImmutableData::new(data_bytes));
-        let user_msg = UserMessage::Request(Request::Put(data, MessageId::new()));
+        let data = ImmutableData::new(data_bytes);
+        let user_msg = UserMessage::Request(Request::PutIData {
+            data: data,
+            msg_id: MessageId::new(),
+        });
         let parts = unwrap!(user_msg.to_parts(1));
         assert_eq!(1, parts.len());
         let part = parts[0].clone();
@@ -1391,18 +1108,27 @@ mod tests {
             content: part,
         };
 
-        let src_sections = vec![SectionList::from(prefix,
-                                                  vec![*full_id_0.public_id(),
-                                                       *full_id_1.public_id(),
-                                                       *full_id_2.public_id()])];
-        let mut signed_msg = unwrap!(SignedMessage::new(routing_message, &full_id_0, src_sections));
+        let src_sections = vec![
+            SectionList::from(
+                prefix,
+                vec![
+                    *full_id_0.public_id(),
+                    *full_id_1.public_id(),
+                    *full_id_2.public_id(),
+                ]
+            ),
+        ];
+        let mut signed_msg = unwrap!(SignedMessage::new(
+            routing_message,
+            &full_id_0,
+            src_sections,
+        ));
         assert_eq!(signed_msg.signatures.len(), 1);
 
         // Try to add a signature which will not correspond to an ID from the sending nodes.
-        let irrelevant_sig = match unwrap!(signed_msg
-                                               .routing_message()
-                                               .to_signature(irrelevant_full_id
-                                                                 .signing_private_key())) {
+        let irrelevant_sig = match unwrap!(signed_msg.routing_message().to_signature(
+            irrelevant_full_id.signing_private_key(),
+        )) {
             DirectMessage::MessageSignature(_, sig) => {
                 signed_msg.add_signature(*irrelevant_full_id.public_id(), sig);
                 sig
@@ -1410,18 +1136,18 @@ mod tests {
             msg => panic!("Unexpected message: {:?}", msg),
         };
         assert_eq!(signed_msg.signatures.len(), 1);
-        assert!(!signed_msg
-                     .signatures
-                     .contains_key(irrelevant_full_id.public_id()));
+        assert!(!signed_msg.signatures.contains_key(
+            irrelevant_full_id.public_id(),
+        ));
         assert!(!signed_msg.check_fully_signed(min_section_size));
 
         // Add a valid signature for ID 1 and an invalid one for ID 2
-        match unwrap!(signed_msg
-                          .routing_message()
-                          .to_signature(full_id_1.signing_private_key())) {
+        match unwrap!(signed_msg.routing_message().to_signature(
+            full_id_1.signing_private_key(),
+        )) {
             DirectMessage::MessageSignature(hash, sig) => {
                 let serialised_msg = unwrap!(serialise(signed_msg.routing_message()));
-                assert_eq!(hash, sha256::hash(&serialised_msg));
+                assert_eq!(hash, sha3_256(&serialised_msg));
                 signed_msg.add_signature(*full_id_1.public_id(), sig);
             }
             msg => panic!("Unexpected message: {:?}", msg),
@@ -1438,9 +1164,9 @@ mod tests {
         // Check an irrelevant signature can't be added.
         signed_msg.add_signature(*irrelevant_full_id.public_id(), irrelevant_sig);
         assert_eq!(signed_msg.signatures.len(), 2);
-        assert!(!signed_msg
-                     .signatures
-                     .contains_key(irrelevant_full_id.public_id()));
+        assert!(!signed_msg.signatures.contains_key(
+            irrelevant_full_id.public_id(),
+        ));
     }
 
     #[test]
@@ -1449,7 +1175,7 @@ mod tests {
         let routing_message = RoutingMessage {
             src: Authority::ClientManager(name),
             dst: Authority::ClientManager(name),
-            content: MessageContent::SectionSplit(Prefix::new(0, name), name),
+            content: MessageContent::SectionSplit(Prefix::new(0, name).with_version(1), name),
         };
         let full_id = FullId::new();
         let senders = iter::empty().collect();
@@ -1457,10 +1183,12 @@ mod tests {
         let signed_message = unwrap!(signed_message_result);
 
         let (public_signing_key, secret_signing_key) = sign::gen_keypair();
-        let hop_message_result = HopMessage::new(signed_message.clone(),
-                                                 0,
-                                                 BTreeSet::new(),
-                                                 &secret_signing_key);
+        let hop_message_result = HopMessage::new(
+            signed_message.clone(),
+            0,
+            BTreeSet::new(),
+            &secret_signing_key,
+        );
 
         let hop_message = unwrap!(hop_message_result);
 
@@ -1475,8 +1203,11 @@ mod tests {
     #[test]
     fn user_message_parts() {
         let data_bytes: Vec<u8> = (0..(MAX_PART_LEN * 2)).map(|i| i as u8).collect();
-        let data = Data::Immutable(ImmutableData::new(data_bytes));
-        let user_msg = UserMessage::Request(Request::Put(data, MessageId::new()));
+        let data = ImmutableData::new(data_bytes);
+        let user_msg = UserMessage::Request(Request::PutIData {
+            data: data,
+            msg_id: MessageId::new(),
+        });
         let msg_hash = sha3_256(&unwrap!(serialise(&user_msg)));
         let parts = unwrap!(user_msg.to_parts(42));
         assert_eq!(parts.len(), 3);
@@ -1484,23 +1215,25 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, msg)| match msg {
-                     MessageContent::UserMessagePart {
-                         hash,
-                         part_count,
-                         part_index,
-                         payload,
-                         priority,
-                         cacheable,
-                     } => {
-                assert_eq!(msg_hash, hash);
-                assert_eq!(3, part_count);
-                assert_eq!(i, part_index as usize);
-                assert_eq!(42, priority);
-                assert!(!cacheable);
-                payload
-            }
-                     msg => panic!("Unexpected message {:?}", msg),
-                 })
+                MessageContent::UserMessagePart {
+                    hash,
+                    msg_id,
+                    part_count,
+                    part_index,
+                    payload,
+                    priority,
+                    cacheable,
+                } => {
+                    assert_eq!(msg_hash, hash);
+                    assert_eq!(user_msg.message_id(), &msg_id);
+                    assert_eq!(3, part_count);
+                    assert_eq!(i, part_index as usize);
+                    assert_eq!(42, priority);
+                    assert!(!cacheable);
+                    payload
+                }
+                msg => panic!("Unexpected message {:?}", msg),
+            })
             .collect();
         let deserialised_user_msg = unwrap!(UserMessage::from_parts(msg_hash, payloads.iter()));
         assert_eq!(user_msg, deserialised_user_msg);

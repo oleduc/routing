@@ -22,9 +22,9 @@ pub const MAX_HEADER_METADATA_SIZE: usize = 128; // bytes
 use super::{Error, GUID_SIZE};
 use maidsafe_utilities::serialisation::serialise;
 use rand::{self, Rng};
-use rust_sodium::crypto::hash::sha256;
 use rust_sodium::crypto::sign::{self, PublicKey, SecretKey, Signature};
 use std::fmt::{self, Debug, Formatter};
+use tiny_keccak::sha3_256;
 use utils;
 use xor_name::XorName;
 
@@ -58,10 +58,11 @@ impl MpidHeader {
     ///
     /// An error will be returned if `metadata` exceeds `MAX_HEADER_METADATA_SIZE` or if
     /// serialisation during the signing process fails.
-    pub fn new(sender: XorName,
-               metadata: Vec<u8>,
-               secret_key: &SecretKey)
-               -> Result<MpidHeader, Error> {
+    pub fn new(
+        sender: XorName,
+        metadata: Vec<u8>,
+        secret_key: &SecretKey,
+    ) -> Result<MpidHeader, Error> {
         if metadata.len() > MAX_HEADER_METADATA_SIZE {
             return Err(Error::MetadataTooLarge);
         }
@@ -75,9 +76,9 @@ impl MpidHeader {
 
         let encoded = serialise(&detail)?;
         Ok(MpidHeader {
-               detail: detail,
-               signature: sign::sign_detached(&encoded, secret_key),
-           })
+            detail: detail,
+            signature: sign::sign_detached(&encoded, secret_key),
+        })
     }
 
     /// The name of the original creator of the message.
@@ -104,7 +105,7 @@ impl MpidHeader {
     /// of the serialised header, so its use should be minimised.
     pub fn name(&self) -> Result<XorName, Error> {
         let encoded = serialise(self)?;
-        Ok(XorName(sha256::hash(&encoded[..]).0))
+        Ok(XorName(sha3_256(&encoded[..])))
     }
 
     /// Validates the header's signature against the provided `PublicKey`.
@@ -118,12 +119,14 @@ impl MpidHeader {
 
 impl Debug for MpidHeader {
     fn fmt(&self, formatter: &mut Formatter) -> Result<(), fmt::Error> {
-        write!(formatter,
-               "MpidHeader {{ sender: {:?}, guid: {}, metadata: {}, signature: {} }}",
-               self.detail.sender,
-               utils::format_binary_array(&self.detail.guid),
-               utils::format_binary_array(&self.detail.metadata),
-               utils::format_binary_array(&self.signature))
+        write!(
+            formatter,
+            "MpidHeader {{ sender: {:?}, guid: {}, metadata: {}, signature: {} }}",
+            self.detail.sender,
+            utils::format_binary_array(&self.detail.guid),
+            utils::format_binary_array(&self.detail.metadata),
+            utils::format_binary_array(&self.signature)
+        )
     }
 }
 
@@ -142,14 +145,14 @@ mod tests {
 
         // Check with metadata which is empty, then at size limit, then just above limit.
         {
-            let header = unwrap!(MpidHeader::new(sender.clone(), vec![], &secret_key));
+            let header = unwrap!(MpidHeader::new(sender, vec![], &secret_key));
             assert!(header.metadata().is_empty());
         }
         let mut metadata = messaging::generate_random_bytes(MAX_HEADER_METADATA_SIZE);
-        let header = unwrap!(MpidHeader::new(sender.clone(), metadata.clone(), &secret_key));
+        let header = unwrap!(MpidHeader::new(sender, metadata.clone(), &secret_key));
         assert_eq!(*header.metadata(), metadata);
         metadata.push(0);
-        assert!(MpidHeader::new(sender.clone(), metadata.clone(), &secret_key).is_err());
+        assert!(MpidHeader::new(sender, metadata.clone(), &secret_key).is_err());
         let _ = metadata.pop();
 
         // Check verify function with a valid and invalid key
@@ -163,8 +166,8 @@ mod tests {
 
         // Check that identically-constructed headers retain identical sender and metadata, but have
         // different GUIDs and signatures.
-        let header1 = unwrap!(MpidHeader::new(sender.clone(), metadata.clone(), &secret_key));
-        let header2 = unwrap!(MpidHeader::new(sender.clone(), metadata.clone(), &secret_key));
+        let header1 = unwrap!(MpidHeader::new(sender, metadata.clone(), &secret_key));
+        let header2 = unwrap!(MpidHeader::new(sender, metadata.clone(), &secret_key));
         assert_ne!(header1, header2);
         assert_eq!(*header1.sender(), sender);
         assert_eq!(header1.sender(), header2.sender());

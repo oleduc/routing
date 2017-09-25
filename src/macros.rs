@@ -20,9 +20,10 @@
 ///
 /// Example usage:
 /// `log_or_panic!(LogLevel::Warn, "{:?} Bad value: {}", self, value);`
+#[macro_export]
 macro_rules! log_or_panic {
     ($log_level:expr, $($arg:tt)*) => {
-        if cfg!(feature = "use-mock-crust") {
+        if cfg!(feature = "use-mock-crust") && !::std::thread::panicking() {
             panic!($($arg)*);
         } else {
             log!($log_level, $($arg)*);

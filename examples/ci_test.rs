@@ -37,7 +37,6 @@
 extern crate log;
 extern crate maidsafe_utilities;
 extern crate rand;
-extern crate rustc_serialize;
 extern crate docopt;
 extern crate rust_sodium;
 extern crate routing;
@@ -66,16 +65,18 @@ mod unnamed {
     use maidsafe_utilities::thread::named as thread_named;
     use rand::{Rng, ThreadRng, random, thread_rng};
     use rand::distributions::{IndependentSample, Range};
-    use routing::{Data, StructuredData};
+    use routing::{MIN_SECTION_SIZE, MutableData, Value};
+    use rust_sodium::crypto::sign;
     use std::{env, io, thread};
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
     use std::io::Write;
+    use std::iter;
     use std::panic;
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
     use term::{self, color};
-    use utils::{ExampleClient, ExampleNode, MIN_SECTION_SIZE};
+    use utils::{ExampleClient, ExampleNode};
 
     const CHURN_MIN_WAIT_SEC: u64 = 20;
     const CHURN_MAX_WAIT_SEC: u64 = 30;
@@ -92,9 +93,11 @@ mod unnamed {
             match self.0.kill() {
                 Ok(()) => println!("Killed Node with Process ID #{}", self.0.id()),
                 Err(err) => {
-                    println!("Error killing Node with Process ID #{} - {:?}",
-                             self.0.id(),
-                             err)
+                    println!(
+                        "Error killing Node with Process ID #{} - {:?}",
+                        self.0.id(),
+                        err
+                    )
                 }
             }
         }
@@ -131,10 +134,11 @@ mod unnamed {
         nodes
     }
 
-    fn simulate_churn(mut nodes: Vec<NodeProcess>,
-                      network_size: usize,
-                      stop_flag: Arc<(Mutex<bool>, Condvar)>)
-                      -> Joiner {
+    fn simulate_churn(
+        mut nodes: Vec<NodeProcess>,
+        network_size: usize,
+        stop_flag: Arc<(Mutex<bool>, Condvar)>,
+    ) -> Joiner {
         thread_named("ChurnSimulationThread", move || {
             let mut rng = thread_rng();
             let wait_range = Range::new(CHURN_MIN_WAIT_SEC, CHURN_MAX_WAIT_SEC);
@@ -150,9 +154,10 @@ mod unnamed {
                     let wait_for = wait_range.ind_sample(&mut rng);
 
                     while !*stop_condition && !wait_timed_out {
-                        let wake_up_result =
-                            unwrap!(condvar.wait_timeout(stop_condition,
-                                                         Duration::from_secs(wait_for)));
+                        let wake_up_result = unwrap!(condvar.wait_timeout(
+                            stop_condition,
+                            Duration::from_secs(wait_for),
+                        ));
                         stop_condition = wake_up_result.0;
                         wait_timed_out = wake_up_result.1.timed_out();
                     }
@@ -162,10 +167,13 @@ mod unnamed {
                     }
                 }
 
-                if let Err(err) = simulate_churn_impl(&mut nodes,
-                                                      &mut rng,
-                                                      network_size,
-                                                      &mut node_count) {
+                if let Err(err) = simulate_churn_impl(
+                    &mut nodes,
+                    &mut rng,
+                    network_size,
+                    &mut node_count,
+                )
+                {
                     println!("{:?}", err);
                     break;
                 }
@@ -173,11 +181,12 @@ mod unnamed {
         })
     }
 
-    fn simulate_churn_impl(nodes: &mut Vec<NodeProcess>,
-                           rng: &mut ThreadRng,
-                           network_size: usize,
-                           node_count: &mut usize)
-                           -> Result<(), io::Error> {
+    fn simulate_churn_impl(
+        nodes: &mut Vec<NodeProcess>,
+        rng: &mut ThreadRng,
+        network_size: usize,
+        node_count: &mut usize,
+    ) -> Result<(), io::Error> {
         print!("Churning on {} active nodes. ", nodes.len());
         io::stdout().flush().expect("Could not flush stdout");
 
@@ -201,15 +210,19 @@ mod unnamed {
             log_path.set_file_name(&format!("Node{:02}.log", node_count));
             let arg = format!("--output={}", log_path.display());
 
-            nodes.push(NodeProcess(Command::new(current_exe_path.clone())
-                                       .arg(arg)
-                                       .stdout(Stdio::null())
-                                       .stderr(Stdio::null())
-                                       .spawn()?,
-                                   *node_count));
-            println!("Started Node #{} with Process ID #{}",
-                     node_count,
-                     nodes[nodes.len() - 1].0.id());
+            nodes.push(NodeProcess(
+                Command::new(current_exe_path.clone())
+                    .arg(arg)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+                *node_count,
+            ));
+            println!(
+                "Started Node #{} with Process ID #{}",
+                node_count,
+                nodes[nodes.len() - 1].0.id()
+            );
         }
 
         Ok(())
@@ -219,8 +232,7 @@ mod unnamed {
         let mut term = term::stdout().expect("Could not open stdout.");
         term.fg(color).expect("Failed to set color");
         print!("{}", text);
-        term.reset()
-            .expect("Failed to restore stdout attributes.");
+        term.reset().expect("Failed to restore stdout attributes.");
         io::stdout().flush().expect("Could not flush stdout");
     }
 
@@ -233,18 +245,24 @@ mod unnamed {
         let mut stored_data = Vec::with_capacity(requests);
         let mut rng = SeededRng::new();
         for i in 0..requests {
-            let raw_data = rng.gen_iter().take(10).collect();
-            let sd = StructuredData::new(10000, rng.gen(), 0, raw_data, BTreeSet::new());
-            let data = Data::Structured(unwrap!(sd));
+            let data = gen_mutable_data(&mut rng, *example_client.signing_public_key());
+
             print!("Putting Data: count #{} - Data {:?} - ", i, data.name());
             io::stdout().flush().expect("Could not flush stdout");
-            if example_client.put(data.clone()).is_ok() {
+
+            if example_client.put_mdata(data.clone()).is_ok() {
                 print_color("OK", color::GREEN);
                 print!(" - getting - ");
                 io::stdout().flush().expect("Could not flush stdout");
+
                 stored_data.push(data.clone());
-                if let Some(got_data) = example_client.get(data.identifier()) {
-                    assert_eq!(got_data, data);
+
+                let shell_res = example_client.get_mdata_shell(*data.name(), data.tag());
+                let entries_res = example_client.list_mdata_entries(*data.name(), data.tag());
+
+                if let (Ok(shell), Ok(entries)) = (shell_res, entries_res) {
+                    assert_eq!(shell, data.shell());
+                    assert_eq!(entries, *data.entries());
                     print_color("OK\n", color::GREEN);
                 } else {
                     test_success = false;
@@ -263,11 +281,16 @@ mod unnamed {
             thread::sleep(Duration::from_secs(CHURN_TIME_SEC));
 
             println!("--------- Getting Data - batch {} -----------", batch);
-            for (i, data_item) in stored_data.iter().enumerate().take(requests) {
-                print!("Get attempt #{} - {} - ", i, data_item.name());
+            for (i, data) in stored_data.iter().enumerate().take(requests) {
+                print!("Get attempt #{} - {} - ", i, data.name());
                 io::stdout().flush().expect("Could not flush stdout");
-                if let Some(data) = example_client.get(data_item.identifier()) {
-                    assert_eq!(data, stored_data[i]);
+
+                let res_shell = example_client.get_mdata_shell(*data.name(), data.tag());
+                let res_entries = example_client.list_mdata_entries(*data.name(), data.tag());
+
+                if let (Ok(shell), Ok(entries)) = (res_shell, res_entries) {
+                    assert_eq!(shell, data.shell());
+                    assert_eq!(entries, *data.entries());
                     print_color("OK\n", color::GREEN);
                 } else {
                     test_success = false;
@@ -278,6 +301,36 @@ mod unnamed {
         }
 
         assert!(test_success, "Failed to store and verify data.");
+    }
+
+    fn gen_mutable_data<R: Rng>(rng: &mut R, owner: sign::PublicKey) -> MutableData {
+        let name = rng.gen();
+        let tag = rng.gen_range(10_000, 20_000);
+
+        let num_entries = rng.gen_range(0, 10);
+        let mut entries = BTreeMap::new();
+
+        for _ in 0..num_entries {
+            let key = rng.gen_iter().take(5).collect();
+            let content = rng.gen_iter().take(10).collect();
+            let _ = entries.insert(
+                key,
+                Value {
+                    content: content,
+                    entry_version: 0,
+                },
+            );
+        }
+
+        let owners = iter::once(owner).collect();
+
+        unwrap!(MutableData::new(
+            name,
+            tag,
+            Default::default(),
+            entries,
+            owners,
+        ))
     }
 
     // ==========================   Program Options   =================================
@@ -297,7 +350,7 @@ Options:
 ";
     // ================================================================================
 
-    #[derive(PartialEq, Eq, Debug, Clone, RustcDecodable)]
+    #[derive(PartialEq, Eq, Debug, Deserialize, Clone)]
     struct Args {
         arg_batches: Option<usize>,
         arg_nodes: Option<usize>,
@@ -309,14 +362,14 @@ Options:
         flag_help: Option<bool>,
     }
 
-    #[cfg_attr(feature="cargo-clippy", allow(mutex_atomic))]
+    #[cfg_attr(feature = "cargo-clippy", allow(mutex_atomic))]
     pub fn run_main() {
         let args: Args = Docopt::new(USAGE)
-            .and_then(|docopt| docopt.decode())
+            .and_then(|docopt| docopt.deserialize())
             .unwrap_or_else(|error| error.exit());
 
         let run_network_test = !(args.flag_output.is_some() ||
-                                 args.flag_delete_bootstrap_cache.is_some());
+                                     args.flag_delete_bootstrap_cache.is_some());
         let requests = args.arg_requests.unwrap_or(DEFAULT_REQUESTS);
         let batches = args.arg_batches.unwrap_or(DEFAULT_BATCHES);
         let first = args.flag_first.unwrap_or(false);

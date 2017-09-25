@@ -17,16 +17,19 @@
 
 use super::routing_table::Error as RoutingTableError;
 use action::Action;
-use crust::{self, PeerId};
+use config_file_handler::Error as ConfigFileHandlerError;
+use crust::CrustError;
 use event::Event;
+use id::PublicId;
 use maidsafe_utilities::event_sender::{EventSenderError, MaidSafeEventCategory};
 use maidsafe_utilities::serialisation;
+use sha3::Digest256;
 use std::sync::mpsc::{RecvError, SendError};
 
 /// The type of errors that can occur if routing is unable to handle a send request.
 #[derive(Debug)]
 // FIXME - See https://maidsafe.atlassian.net/browse/MAID-2026 for info on removing this exclusion.
-#[cfg_attr(feature="cargo-clippy", allow(large_enum_variant))]
+#[cfg_attr(feature = "cargo-clippy", allow(large_enum_variant))]
 pub enum InterfaceError {
     /// We are not connected to the network.
     NotConnected,
@@ -53,7 +56,7 @@ impl From<RecvError> for InterfaceError {
 /// The type of errors that can occur during handling of routing events.
 #[derive(Debug)]
 // FIXME - See https://maidsafe.atlassian.net/browse/MAID-2026 for info on removing this exclusion.
-#[cfg_attr(feature="cargo-clippy", allow(large_enum_variant))]
+#[cfg_attr(feature = "cargo-clippy", allow(large_enum_variant))]
 pub enum RoutingError {
     /// The node/client has not bootstrapped yet
     NotBootstrapped,
@@ -79,8 +82,8 @@ pub enum RoutingError {
     FilterCheckFailed,
     /// Failure to bootstrap off the provided endpoints
     FailedToBootstrap,
-    /// Public id rejected because of disallowed relocated status
-    RejectedPublicId,
+    /// Node's new name doesn't fall within the specified target address range.
+    InvalidRelocationTargetRange,
     /// A client with `client_restriction == true` tried to send a message restricted to nodes.
     RejectedClientMessage,
     /// Routing Table error
@@ -92,7 +95,7 @@ pub enum RoutingError {
     /// i/o error
     Io(::std::io::Error),
     /// Crust error
-    Crust(crust::CrustError),
+    Crust(CrustError),
     /// Channel sending error
     SendEventError(SendError<Event>),
     /// Current state is invalid for the operation
@@ -102,7 +105,7 @@ pub enum RoutingError {
     /// Asymmetric Decryption Failure
     AsymmetricDecryptionFailure,
     /// Unknown Connection
-    UnknownConnection(PeerId),
+    UnknownConnection(PublicId),
     /// Invalid Destination
     InvalidDestination,
     /// Connection to proxy node does not exist in proxy map
@@ -115,6 +118,8 @@ pub enum RoutingError {
     CannotTunnelThroughTunnel,
     /// Decoded a user message with an unexpected hash.
     HashMismatch,
+    /// Version check has failed
+    InvalidSuccessor,
     /// Candidate is unknown
     UnknownCandidate,
     /// Operation timed out
@@ -123,6 +128,15 @@ pub enum RoutingError {
     FailedResourceProofValidation,
     /// Candidate is connected via a tunnel
     CandidateIsTunnelling,
+    /// Content of a received message is inconsistent.
+    InvalidMessage,
+    /// Invalid Peer
+    InvalidPeer,
+    /// The client's message indicated by the included hash digest has been rejected by the
+    /// rate-limiter.
+    ExceedsRateLimit(Digest256),
+    /// Invalid configuration
+    ConfigError(ConfigFileHandlerError),
 }
 
 impl From<RoutingTableError> for RoutingError {
@@ -149,8 +163,8 @@ impl From<InterfaceError> for RoutingError {
     }
 }
 
-impl From<crust::CrustError> for RoutingError {
-    fn from(error: crust::CrustError) -> RoutingError {
+impl From<CrustError> for RoutingError {
+    fn from(error: CrustError) -> RoutingError {
         RoutingError::Crust(error)
     }
 }
@@ -164,5 +178,30 @@ impl From<SendError<Event>> for RoutingError {
 impl From<serialisation::SerialisationError> for RoutingError {
     fn from(error: serialisation::SerialisationError) -> RoutingError {
         RoutingError::SerialisationError(error)
+    }
+}
+
+impl From<ConfigFileHandlerError> for RoutingError {
+    fn from(error: ConfigFileHandlerError) -> RoutingError {
+        RoutingError::ConfigError(error)
+    }
+}
+
+quick_error! {
+    #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+    pub enum BootstrapResponseError {
+        NotApproved {
+            description("Proxy not approved yet")
+            display("The chosen proxy node has not yet been approved by the network.")
+        }
+        TooFewPeers {
+            description("Proxy has too few peers")
+            display("The chosen proxy node has too few connections to peers.")
+        }
+        ClientLimit {
+            description("Proxy has max. clients")
+            display("The chosen proxy node already has connections to the maximum number of \
+                     clients allowed per proxy.")
+        }
     }
 }

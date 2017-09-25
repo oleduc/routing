@@ -15,20 +15,21 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
-use super::DataIdentifier;
-use maidsafe_utilities::serialisation::serialised_size;
-use rust_sodium::crypto::hash::sha256;
-use serde::{Deserialize, Deserializer};
+use maidsafe_utilities::serialisation;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{self, Debug, Formatter};
+use tiny_keccak::sha3_256;
 use xor_name::XorName;
 
 /// Maximum allowed size for a serialised Immutable Data (ID) to grow to
 pub const MAX_IMMUTABLE_DATA_SIZE_IN_BYTES: u64 = 1024 * 1024 + 10 * 1024;
 
 /// An immutable chunk of data.
-#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+///
+/// Note that the `name` member is omitted when serialising `ImmutableData` and is calculated from
+/// the `value` when deserialising.
+#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ImmutableData {
-    #[serde(skip_serializing)]
     name: XorName,
     value: Vec<u8>,
 }
@@ -37,7 +38,7 @@ impl ImmutableData {
     /// Creates a new instance of `ImmutableData`
     pub fn new(value: Vec<u8>) -> ImmutableData {
         ImmutableData {
-            name: XorName(sha256::hash(&value).0),
+            name: XorName(sha3_256(&value)),
             value: value,
         }
     }
@@ -46,7 +47,6 @@ impl ImmutableData {
     pub fn value(&self) -> &Vec<u8> {
         &self.value
     }
-
 
     /// Returns name ensuring invariant.
     pub fn name(&self) -> &XorName {
@@ -58,25 +58,27 @@ impl ImmutableData {
         self.value.len()
     }
 
-    /// Returns `DataIdentifier` for this data element.
-    pub fn identifier(&self) -> DataIdentifier {
-        DataIdentifier::Immutable(self.name)
+    /// Returns size of this data after serialisation.
+    pub fn serialised_size(&self) -> u64 {
+        serialisation::serialised_size(self)
     }
 
     /// Return true if the size is valid
     pub fn validate_size(&self) -> bool {
-        serialised_size(self) <= MAX_IMMUTABLE_DATA_SIZE_IN_BYTES
+        self.serialised_size() <= MAX_IMMUTABLE_DATA_SIZE_IN_BYTES
     }
 }
 
+impl Serialize for ImmutableData {
+    fn serialize<S: Serializer>(&self, serialiser: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serialiser)
+    }
+}
 
-impl Deserialize for ImmutableData {
-    fn deserialize<D: Deserializer>(deserializer: D) -> Result<ImmutableData, D::Error> {
+impl<'de> Deserialize<'de> for ImmutableData {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<ImmutableData, D::Error> {
         let value: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        Ok(ImmutableData {
-               name: XorName(sha256::hash(&value).0),
-               value: value,
-           })
+        Ok(ImmutableData::new(value))
     }
 }
 
@@ -90,16 +92,27 @@ impl Debug for ImmutableData {
 mod tests {
     use super::*;
     use hex::ToHex;
+    use maidsafe_utilities::{SeededRng, serialisation};
+    use rand::Rng;
 
     #[test]
     fn deterministic_test() {
         let value = "immutable data value".to_owned().into_bytes();
-
-        // Normal
         let immutable_data = ImmutableData::new(value);
         let immutable_data_name = immutable_data.name().0.as_ref().to_hex();
-        let expected_name = "ec0775555a7a6afba5f6e0a1deaa06f8928da80cf6ca94742ecc2a00c31033d3";
+        let expected_name = "fac2869677ee06277633c37ac7e8e5c655f3d652f707c7a79fab930d584a3016";
 
         assert_eq!(&expected_name, &immutable_data_name);
+    }
+
+    #[test]
+    fn serialisation() {
+        let mut rng = SeededRng::thread_rng();
+        let len = rng.gen_range(1, 10000);
+        let value = rng.gen_iter().take(len).collect();
+        let immutable_data = ImmutableData::new(value);
+        let serialised = unwrap!(serialisation::serialise(&immutable_data));
+        let parsed = unwrap!(serialisation::deserialise(&serialised));
+        assert_eq!(immutable_data, parsed);
     }
 }

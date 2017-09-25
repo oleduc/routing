@@ -15,9 +15,10 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
-
 use error::InterfaceError;
+use id::PublicId;
 use messages::{Request, UserMessage};
+use messages::DirectMessage;
 use routing_table::Authority;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::mpsc::Sender;
@@ -29,9 +30,8 @@ use xor_name::XorName;
 ///    2. `Action::Terminate` indicates to `Core` that no new actions should be taken and all
 ///       pending events should be handled.
 ///       After completion `Core` will send `Event::Terminated`.
-#[derive(Clone)]
 // FIXME - See https://maidsafe.atlassian.net/browse/MAID-2026 for info on removing this exclusion.
-#[cfg_attr(feature="cargo-clippy", allow(large_enum_variant))]
+#[cfg_attr(feature = "cargo-clippy", allow(large_enum_variant))]
 pub enum Action {
     NodeSendMessage {
         src: Authority<XorName>,
@@ -46,8 +46,9 @@ pub enum Action {
         priority: u8,
         result_tx: Sender<Result<(), InterfaceError>>,
     },
-    Name { result_tx: Sender<XorName> },
+    Id { result_tx: Sender<PublicId> },
     Timeout(u64),
+    ResourceProofResult(PublicId, Vec<DirectMessage>),
     Terminate,
 }
 
@@ -55,22 +56,29 @@ impl Debug for Action {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
         match *self {
             Action::NodeSendMessage { ref content, .. } => {
-                write!(formatter,
-                       "Action::NodeSendMessage {{ {:?}, result_tx }}",
-                       content)
+                write!(
+                    formatter,
+                    "Action::NodeSendMessage {{ {:?}, result_tx }}",
+                    content
+                )
             }
             Action::ClientSendRequest {
                 ref content,
                 ref dst,
                 ..
             } => {
-                write!(formatter,
-                       "Action::ClientSendRequest {{ {:?}, dst: {:?}, result_tx }}",
-                       content,
-                       dst)
+                write!(
+                    formatter,
+                    "Action::ClientSendRequest {{ {:?}, dst: {:?}, result_tx }}",
+                    content,
+                    dst
+                )
             }
-            Action::Name { .. } => write!(formatter, "Action::Name"),
+            Action::Id { .. } => write!(formatter, "Action::Id"),
             Action::Timeout(token) => write!(formatter, "Action::Timeout({})", token),
+            Action::ResourceProofResult(pub_id, _) => {
+                write!(formatter, "Action::ResourceProofResult({:?}, ...)", pub_id)
+            }
             Action::Terminate => write!(formatter, "Action::Terminate"),
         }
     }

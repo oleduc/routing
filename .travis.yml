@@ -2,49 +2,43 @@ env:
   global:
     - RUST_BACKTRACE=1
     - PATH=$PATH:$HOME/.cargo/bin
+    - TEST_FEATURES="use-mock-crust use-mock-crypto"
 os:
   - linux
   - osx
 language: rust
 rust:
-  - 1.16.0
-  - nightly-2017-03-16
+  - 1.19.0
+  - nightly-2017-07-20
 sudo: false
-branches:
-  only:
-    - master
-    - stable
 cache:
   cargo: true
 before_script:
-  - (which cargo-install-update && cargo install-update cargo-update) || cargo install cargo-update
-  - (which cargo-prune && cargo install-update cargo-prune) || cargo install cargo-prune
-  - if [ "${TRAVIS_RUST_VERSION}" = 1.16.0 ]; then
-      (which rustfmt && cargo install-update rustfmt) || cargo install rustfmt;
+  - curl -sSL https://github.com/maidsafe/QA/raw/master/travis/cargo_install.sh > cargo_install.sh
+  - bash cargo_install.sh cargo-prune;
+  - if [ "${TRAVIS_RUST_VERSION}" = 1.19.0 ]; then
+      bash cargo_install.sh rustfmt 0.9.0;
     elif [ "${TRAVIS_OS_NAME}" = linux ]; then
-      clippy_vers=0.0.120;
-      if ! cargo clippy --version | grep -q $clippy_vers; then
-        cargo install clippy --vers=$clippy_vers --force;
-      fi
+      bash cargo_install.sh clippy 0.0.144;
     fi
 script:
-  - if [ "${TRAVIS_RUST_VERSION}" = 1.16.0 ]; then
+  - export RUSTFLAGS="-C opt-level=2 -C codegen-units=8"
+  - if [ "${TRAVIS_RUST_VERSION}" = 1.19.0 ]; then
       (
         set -x;
         cargo fmt -- --write-mode=diff &&
-        cargo rustc --verbose -- --test -Zno-trans &&
-        cargo rustc --verbose --example ci_test -- -Zno-trans &&
-        cargo rustc --verbose --example key_value_store -- -Zno-trans &&
-        cargo rustc --verbose -- -Zno-trans &&
-        env RUSTFLAGS="-C opt-level=2 -C codegen-units=8" cargo test --release --verbose --features use-mock-crust
+        cargo check --verbose --lib --tests &&
+        cargo check --verbose --example ci_test &&
+        cargo check --verbose --example key_value_store &&
+        cargo test --release --verbose --features "$TEST_FEATURES"
       );
     elif [ "${TRAVIS_OS_NAME}" = linux ]; then
       (
         set -x;
         cargo clippy &&
-        cargo clippy --features=use-mock-crust &&
+        cargo clippy --features="$TEST_FEATURES" &&
         cargo clippy --profile=test &&
-        cargo clippy --profile=test --features=use-mock-crust
+        cargo clippy --profile=test --features="$TEST_FEATURES"
       );
     fi
 before_cache:

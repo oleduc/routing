@@ -65,7 +65,7 @@
 //! let (sender, receiver) = mpsc::channel::<Event>();
 //! let full_id = FullId::new(); // Generate new keys.
 //! # #[cfg(not(feature = "use-mock-crust"))]
-//! let client = Client::new(sender, Some(full_id)).unwrap();
+//! let client = Client::new(sender, Some(full_id), None).unwrap();
 //! ```
 //!
 //! Messages can be sent using the methods of `client`, and received as `Event`s from the
@@ -80,8 +80,7 @@
 //! # #![allow(unused)]
 //! use routing::Node;
 //!
-//! let min_section_size = 8;
-//! let node = Node::builder().create(min_section_size).unwrap();
+//! let node = Node::builder().create().unwrap();
 //! ```
 //!
 //! Upon creation, the node will first connect to the network as a client. Once it has client
@@ -121,11 +120,15 @@
 
 #![cfg_attr(feature="cargo-clippy", deny(unicode_not_nfc, wrong_pub_self_convention,
                                     option_unwrap_used))]
+// Allow `panic_params` until https://github.com/Manishearth/rust-clippy/issues/768 is resolved.
+#![cfg_attr(feature="cargo-clippy", allow(panic_params))]
 
-extern crate accumulator;
+extern crate config_file_handler;
 extern crate hex;
 #[macro_use]
 extern crate log;
+#[cfg(feature = "use-mock-crust")]
+extern crate fake_clock;
 extern crate maidsafe_utilities;
 #[macro_use]
 extern crate quick_error;
@@ -135,12 +138,16 @@ extern crate unwrap;
 extern crate crust;
 extern crate itertools;
 extern crate lru_time_cache;
+extern crate num_bigint;
 extern crate rand;
 extern crate resource_proof;
+#[cfg(not(feature = "use-mock-crypto"))]
 extern crate rust_sodium;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[cfg(test)]
+extern crate serde_json;
 extern crate tiny_keccak;
 
 // Needs to be before all other modules to make the macros available to them.
@@ -149,8 +156,12 @@ mod macros;
 
 mod ack_manager;
 mod action;
-mod client;
 mod cache;
+mod client;
+mod client_error;
+mod common_types;
+mod config_handler;
+mod cumulative_own_section_merge;
 mod data;
 mod error;
 mod event;
@@ -162,6 +173,8 @@ mod messages;
 mod node;
 mod outbox;
 mod peer_manager;
+mod rate_limiter;
+mod resource_prover;
 mod routing_message_filter;
 mod routing_table;
 mod signature_accumulator;
@@ -174,6 +187,15 @@ mod types;
 mod utils;
 mod xor_name;
 
+#[cfg(feature = "use-mock-crypto")]
+pub mod mock_crypto;
+
+#[cfg(feature = "use-mock-crypto")]
+use mock_crypto::rust_sodium;
+
+/// Reexports `crust::Config`
+pub type BootstrapConfig = crust::Config;
+
 /// Mock crust
 #[cfg(feature = "use-mock-crust")]
 pub mod mock_crust;
@@ -183,32 +205,43 @@ pub mod sha3;
 
 /// Messaging infrastructure
 pub mod messaging;
-/// Error communication between vaults and core
-pub mod client_errors;
-
 /// Structured Data Tag for Session Packet Type
 pub const TYPE_TAG_SESSION_PACKET: u64 = 0;
 /// Structured Data Tag for DNS Packet Type
 pub const TYPE_TAG_DNS_PACKET: u64 = 5;
 
-/// The quorum, as a percentage of the number of members of the authority.
-pub const QUORUM: usize = 51;
+/// Quorum is defined as having strictly greater than `QUORUM_NUMERATOR / QUORUM_DENOMINATOR`
+/// agreement; using only integer arithmetic a quorum can be checked with
+/// `votes * QUORUM_DENOMINATOR > voters * QUORUM_NUMERATOR`.
+pub const QUORUM_NUMERATOR: usize = 1;
+/// See `QUORUM_NUMERATOR`.
+pub const QUORUM_DENOMINATOR: usize = 2;
+
+/// Default minimal section size.
+pub const MIN_SECTION_SIZE: usize = 8;
+/// Key of an account data in the account packet
+pub const ACC_LOGIN_ENTRY_KEY: &'static [u8] = b"Login";
 
 pub use cache::{Cache, NullCache};
 pub use client::Client;
-pub use data::{AppendWrapper, AppendedData, Data, DataIdentifier, Filter, ImmutableData,
-               MAX_IMMUTABLE_DATA_SIZE_IN_BYTES, MAX_PRIV_APPENDABLE_DATA_SIZE_IN_BYTES,
-               MAX_PUB_APPENDABLE_DATA_SIZE_IN_BYTES, MAX_STRUCTURED_DATA_SIZE_IN_BYTES,
-               NO_OWNER_PUB_KEY, PrivAppendableData, PrivAppendedData, PubAppendableData,
-               StructuredData};
+pub use client_error::{ClientError, EntryError};
+pub use common_types::AccountPacket;
+pub use config_handler::{Config, DevConfig};
+pub use data::{Action, EntryAction, EntryActions, ImmutableData, MAX_IMMUTABLE_DATA_SIZE_IN_BYTES,
+               MAX_MUTABLE_DATA_ENTRIES, MAX_MUTABLE_DATA_SIZE_IN_BYTES, MutableData,
+               NO_OWNER_PUB_KEY, PermissionSet, User, Value};
 pub use error::{InterfaceError, RoutingError};
 pub use event::Event;
 pub use event_stream::EventStream;
 pub use id::{FullId, PublicId};
-pub use messages::{Request, Response};
+pub use messages::{AccountInfo, Request, Response};
 #[cfg(feature = "use-mock-crust")]
 pub use mock_crust::crust;
 pub use node::{Node, NodeBuilder};
+#[cfg(feature = "use-mock-crust")]
+pub use peer_manager::test_consts;
+#[cfg(feature = "use-mock-crust")]
+pub use rate_limiter::rate_limiter_consts;
 pub use routing_table::{Authority, Prefix, RoutingTable, Xorable};
 pub use routing_table::Error as RoutingTableError;
 #[cfg(any(test, feature = "use-mock-crust"))]
@@ -216,14 +249,26 @@ pub use routing_table::verify_network_invariant;
 pub use types::MessageId;
 pub use xor_name::{XOR_NAME_BITS, XOR_NAME_LEN, XorName, XorNameFromHexError};
 
+type Service = crust::Service<PublicId>;
+use crust::Event as CrustEvent;
+type CrustEventSender = crust::CrustEventSender<PublicId>;
+type PrivConnectionInfo = crust::PrivConnectionInfo<PublicId>;
+type PubConnectionInfo = crust::PubConnectionInfo<PublicId>;
+
 #[cfg(test)]
 mod tests {
-    use super::QUORUM;
+    use super::{QUORUM_DENOMINATOR, QUORUM_NUMERATOR};
 
     #[test]
-    #[cfg_attr(feature="cargo-clippy", allow(eq_op))]
-    fn quorum_percentage() {
-        assert!(QUORUM <= 100 && QUORUM > 50,
-                "Quorum percentage isn't between 51 and 100");
+    #[cfg_attr(feature = "cargo-clippy", allow(eq_op))]
+    fn quorum_check() {
+        assert!(
+            QUORUM_NUMERATOR < QUORUM_DENOMINATOR,
+            "Quorum impossible to achieve"
+        );
+        assert!(
+            QUORUM_NUMERATOR * 2 >= QUORUM_DENOMINATOR,
+            "Quorum does not guarantee agreement"
+        );
     }
 }

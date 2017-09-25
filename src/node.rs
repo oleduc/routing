@@ -15,65 +15,100 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
+use MIN_SECTION_SIZE;
 use action::Action;
 use cache::{Cache, NullCache};
-#[cfg(feature = "use-mock-crust")]
-use crust::PeerId;
-use data::{Data, DataIdentifier};
+use client_error::ClientError;
+use config_handler::{self, Config};
+use data::{EntryAction, ImmutableData, MutableData, PermissionSet, User, Value};
 use error::{InterfaceError, RoutingError};
 use event::Event;
 use event_stream::{EventStepper, EventStream};
-use id::FullId;
-#[cfg(feature = "use-mock-crust")]
-use id::PublicId;
-use messages::{CLIENT_GET_PRIORITY, DEFAULT_PRIORITY, RELOCATE_PRIORITY, Request, Response,
-               UserMessage};
+use id::{FullId, PublicId};
+use messages::{AccountInfo, CLIENT_GET_PRIORITY, DEFAULT_PRIORITY, RELOCATE_PRIORITY, Request,
+               Response, UserMessage};
 use outbox::{EventBox, EventBuf};
+use routing_table::{Authority, RoutingTable};
 #[cfg(feature = "use-mock-crust")]
-use routing_table::{Prefix, RoutingTable};
-use routing_table::Authority;
+use routing_table::Prefix;
 #[cfg(not(feature = "use-mock-crust"))]
 use rust_sodium;
-#[cfg(feature = "use-mock-crust")]
 use rust_sodium::crypto::sign;
 use state_machine::{State, StateMachine};
-use states;
-#[cfg(feature = "use-mock-crust")]
-use std::collections::BTreeMap;
+use states::{self, Bootstrapping, BootstrappingTargetState};
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "use-mock-crust")]
 use std::fmt::{self, Debug, Formatter};
+#[cfg(feature = "use-mock-crust")]
+use std::net::IpAddr;
 use std::sync::mpsc::{Receiver, RecvError, Sender, TryRecvError, channel};
 use types::{MessageId, RoutingActionSender};
 use xor_name::XorName;
+
+// Helper macro to implement request sending methods.
+macro_rules! impl_request {
+    ($method:ident, $message:ident { $($pname:ident : $ptype:ty),*, }, $priority:expr) => {
+        #[allow(missing_docs)]
+        #[cfg_attr(feature = "cargo-clippy", allow(too_many_arguments))]
+        pub fn $method(&mut self,
+                       src: Authority<XorName>,
+                       dst: Authority<XorName>,
+                       $($pname: $ptype),*)
+                       -> Result<(), InterfaceError> {
+            let msg = UserMessage::Request(Request::$message {
+                $($pname: $pname),*,
+            });
+
+            self.send_action(src, dst, msg, $priority)
+        }
+    };
+
+    ($method:ident, $message:ident { $($pname:ident : $ptype:ty),* }, $priority:expr) => {
+        impl_request!($method, $message { $($pname:$ptype),*, }, $priority);
+    };
+}
+
+// Helper macro to implement response sending methods.
+macro_rules! impl_response {
+    ($method:ident, $message:ident, $payload:ty, $priority:expr) => {
+        #[allow(missing_docs)]
+        pub fn $method(&mut self,
+                       src: Authority<XorName>,
+                       dst: Authority<XorName>,
+                       res: Result<$payload, ClientError>,
+                       msg_id: MessageId)
+                       -> Result<(), InterfaceError> {
+            let msg = UserMessage::Response(Response::$message {
+                res: res,
+                msg_id: msg_id,
+            });
+            self.send_action(src, dst, msg, $priority)
+        }
+    };
+}
 
 /// A builder to configure and create a new `Node`.
 pub struct NodeBuilder {
     cache: Box<Cache>,
     first: bool,
-    deny_other_local_nodes: bool,
+    config: Option<Config>,
 }
 
 impl NodeBuilder {
     /// Configures the node to use the given request cache.
     pub fn cache(self, cache: Box<Cache>) -> NodeBuilder {
-        NodeBuilder {
-            cache: cache,
-            ..self
-        }
+        NodeBuilder { cache, ..self }
     }
 
     /// Configures the node to start a new network instead of joining an existing one.
     pub fn first(self, first: bool) -> NodeBuilder {
-        NodeBuilder {
-            first: first,
-            ..self
-        }
+        NodeBuilder { first, ..self }
     }
 
-    /// Causes node creation to fail if another node on the local network is detected.
-    pub fn deny_other_local_nodes(self) -> NodeBuilder {
+    /// The node will use the configuration options from `config` rather than defaults.
+    pub fn config(self, config: Config) -> NodeBuilder {
         NodeBuilder {
-            deny_other_local_nodes: true,
+            config: Some(config),
             ..self
         }
     }
@@ -84,63 +119,66 @@ impl NodeBuilder {
     /// request a new name and integrate itself into the network using the new name.
     ///
     /// The initial `Node` object will have newly generated keys.
-    pub fn create(self, min_section_size: usize) -> Result<Node, RoutingError> {
+    pub fn create(self) -> Result<Node, RoutingError> {
         // If we're not in a test environment where we might want to manually seed the crypto RNG
         // then seed randomly.
-        #[cfg(not(feature = "use-mock-crust"))]
-        rust_sodium::init();
+        #[cfg(not(feature = "use-mock-crust"))] rust_sodium::init();
 
         let mut ev_buffer = EventBuf::new();
 
         // start the handler for routing without a restriction to become a full node
-        let (_, machine) = self.make_state_machine(min_section_size, &mut ev_buffer);
-
+        let (_, machine) = self.make_state_machine(&mut ev_buffer);
         let (tx, rx) = channel();
 
         Ok(Node {
-               interface_result_tx: tx,
-               interface_result_rx: rx,
-               machine: machine,
-               event_buffer: ev_buffer,
-           })
+            interface_result_tx: tx,
+            interface_result_rx: rx,
+            machine: machine,
+            event_buffer: ev_buffer,
+        })
     }
 
-    // TODO - remove this `rustfmt_skip` once rustfmt stops adding trailing space at `else if`.
-    #[cfg_attr(rustfmt, rustfmt_skip)]
-    fn make_state_machine(self,
-                          min_section_size: usize,
-                          outbox: &mut EventBox)
-                          -> (RoutingActionSender, StateMachine) {
+    fn make_state_machine(self, outbox: &mut EventBox) -> (RoutingActionSender, StateMachine) {
         let full_id = FullId::new();
+        let pub_id = *full_id.public_id();
+        let config = self.config.unwrap_or_else(config_handler::get_config);
+        let dev_config = config.dev.unwrap_or_default();
+        let min_section_size = dev_config.min_section_size.unwrap_or(MIN_SECTION_SIZE);
 
-        StateMachine::new(move |crust_service, timer, outbox2| if self.first {
-                              if let Some(state) = states::Node::first(self.cache,
-                                                                       crust_service,
-                                                                       full_id,
-                                                                       min_section_size,
-                                                                       timer) {
-                                  State::Node(state)
-                              } else {
-                                  State::Terminated
-                              }
-                          } else if
-                              self.deny_other_local_nodes && crust_service.has_peers_on_lan() {
-                              error!("Bootstrapping({:?}) More than 1 routing node found on LAN. \
-                                      Currently this is not supported",
-                                     full_id.public_id().name());
-
-                              outbox2.send_event(Event::Terminate);
-                              State::Terminated
-                          } else {
-                              states::Bootstrapping::new(self.cache,
-                                                         false,
-                                                         crust_service,
-                                                         full_id,
-                                                         min_section_size,
-                                                         timer)
-                                  .map_or(State::Terminated, State::Bootstrapping)
-                          },
-                          outbox)
+        StateMachine::new(
+            move |action_sender, crust_service, timer, outbox2| if self.first {
+                if let Some(state) = states::Node::first(
+                    action_sender,
+                    self.cache,
+                    crust_service,
+                    full_id,
+                    min_section_size,
+                    timer,
+                )
+                {
+                    State::Node(state)
+                } else {
+                    State::Terminated
+                }
+            } else if !dev_config.allow_multiple_lan_nodes && crust_service.has_peers_on_lan() {
+                error!("More than one routing node found on LAN. Currently this is not supported.");
+                outbox2.send_event(Event::Terminate);
+                State::Terminated
+            } else {
+                Bootstrapping::new(
+                    action_sender,
+                    self.cache,
+                    BootstrappingTargetState::JoiningNode,
+                    crust_service,
+                    full_id,
+                    min_section_size,
+                    timer,
+                ).map_or(State::Terminated, State::Bootstrapping)
+            },
+            pub_id,
+            None,
+            outbox,
+        )
     }
 }
 
@@ -164,239 +202,292 @@ impl Node {
         NodeBuilder {
             cache: Box::new(NullCache),
             first: false,
-            deny_other_local_nodes: false,
+            config: None,
         }
     }
 
-    /// Send a `Get` request to `dst` to retrieve data from the network.
-    pub fn send_get_request(&mut self,
-                            src: Authority<XorName>,
-                            dst: Authority<XorName>,
-                            data_request: DataIdentifier,
-                            id: MessageId)
-                            -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Request(Request::Get(data_request, id));
-        self.send_action(src, dst, user_msg, RELOCATE_PRIORITY)
-    }
+    /// Send a `GetIData` request to `dst` to retrieve data from the network.
+    impl_request!(
+        send_get_idata_request,
+        GetIData {
+            name: XorName,
+            msg_id: MessageId,
+        },
+        RELOCATE_PRIORITY
+    );
 
-    /// Send a `Put` request to `dst` to store data on the network.
-    pub fn send_put_request(&mut self,
-                            src: Authority<XorName>,
-                            dst: Authority<XorName>,
-                            data: Data,
-                            id: MessageId)
-                            -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Request(Request::Put(data, id));
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
+    /// Send a `PutIData` request to `dst` to store data on the network.
+    impl_request!(
+        send_put_idata_request,
+        PutIData {
+            data: ImmutableData,
+            msg_id: MessageId,
+        },
+        DEFAULT_PRIORITY
+    );
 
-    /// Send a `Post` request to `dst` to modify data on the network.
-    pub fn send_post_request(&mut self,
-                             src: Authority<XorName>,
-                             dst: Authority<XorName>,
-                             data: Data,
-                             id: MessageId)
-                             -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Request(Request::Post(data, id));
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
+    /// Send a `GetMData` request to `dst` to retrieve data from the network.
+    /// Note: responses to this request are unlikely to accumulate during churn.
+    impl_request!(
+        send_get_mdata_request,
+        GetMData {
+            name: XorName,
+            tag: u64,
+            msg_id: MessageId,
+        },
+        RELOCATE_PRIORITY
+    );
 
-    /// Send a `Delete` request to `dst` to remove data from the network.
-    pub fn send_delete_request(&mut self,
-                               src: Authority<XorName>,
-                               dst: Authority<XorName>,
-                               data: Data,
-                               id: MessageId)
-                               -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Request(Request::Delete(data, id));
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
+    /// Send a `PutMData` request.
+    impl_request!(
+        send_put_mdata_request,
+        PutMData {
+            data: MutableData,
+            msg_id: MessageId,
+            requester: sign::PublicKey,
+        },
+        DEFAULT_PRIORITY
+    );
 
-    /// Respond to a `Get` request indicating success and sending the requested data.
-    pub fn send_get_success(&mut self,
-                            src: Authority<XorName>,
-                            dst: Authority<XorName>,
-                            data: Data,
-                            id: MessageId)
-                            -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::GetSuccess(data, id));
-        let priority = if dst.is_client() {
-            CLIENT_GET_PRIORITY
-        } else {
-            RELOCATE_PRIORITY
-        };
-        self.send_action(src, dst, user_msg, priority)
-    }
+    /// Send a `MutateMDataEntries` request.
+    impl_request!(send_mutate_mdata_entries_request,
+                  MutateMDataEntries {
+                      name: XorName,
+                      tag: u64,
+                      actions: BTreeMap<Vec<u8>, EntryAction>,
+                      msg_id: MessageId,
+                      requester: sign::PublicKey,
+                  },
+                  DEFAULT_PRIORITY);
 
-    /// Respond to a `Get` request indicating failure.
-    pub fn send_get_failure(&mut self,
-                            src: Authority<XorName>,
-                            dst: Authority<XorName>,
-                            data_id: DataIdentifier,
-                            external_error_indicator: Vec<u8>,
-                            id: MessageId)
-                            -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::GetFailure {
-                                                 id: id,
-                                                 data_id: data_id,
-                                                 external_error_indicator: external_error_indicator,
-                                             });
-        let priority = if dst.is_client() {
-            CLIENT_GET_PRIORITY
-        } else {
-            RELOCATE_PRIORITY
-        };
-        self.send_action(src, dst, user_msg, priority)
-    }
+    /// Send a `GetMDataShell` request.
+    impl_request!(send_get_mdata_shell_request,
+                  GetMDataShell {
+                      name: XorName,
+                      tag: u64,
+                      msg_id: MessageId,
+                  },
+                  RELOCATE_PRIORITY);
 
-    /// Respond to a `Put` request indicating success.
-    pub fn send_put_success(&mut self,
-                            src: Authority<XorName>,
-                            dst: Authority<XorName>,
-                            name: DataIdentifier,
-                            id: MessageId)
-                            -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::PutSuccess(name, id));
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
+    /// Send a `GetMDataValue` request.
+    impl_request!(send_get_mdata_value_request,
+                  GetMDataValue {
+                      name: XorName,
+                      tag: u64,
+                      key: Vec<u8>,
+                      msg_id: MessageId,
+                  },
+                  RELOCATE_PRIORITY);
 
-    /// Respond to a `Put` request indicating failure.
-    pub fn send_put_failure(&mut self,
-                            src: Authority<XorName>,
-                            dst: Authority<XorName>,
-                            data_id: DataIdentifier,
-                            external_error_indicator: Vec<u8>,
-                            id: MessageId)
-                            -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::PutFailure {
-                                                 id: id,
-                                                 data_id: data_id,
-                                                 external_error_indicator: external_error_indicator,
-                                             });
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
+    /// Send a `SetMDataUserPermissions` request.
+    impl_request!(send_set_mdata_user_permissions_request,
+                  SetMDataUserPermissions {
+                      name: XorName,
+                      tag: u64,
+                      user: User,
+                      permissions: PermissionSet,
+                      version: u64,
+                      msg_id: MessageId,
+                      requester: sign::PublicKey,
+                  }, DEFAULT_PRIORITY);
 
-    /// Respond to a `Post` request indicating success.
-    pub fn send_post_success(&mut self,
-                             src: Authority<XorName>,
-                             dst: Authority<XorName>,
-                             name: DataIdentifier,
-                             id: MessageId)
-                             -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::PostSuccess(name, id));
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
+    /// Send a `DelMDataUserPermissions` request.
+    impl_request!(send_del_mdata_user_permissions_request,
+                  DelMDataUserPermissions {
+                      name: XorName,
+                      tag: u64,
+                      user: User,
+                      version: u64,
+                      msg_id: MessageId,
+                      requester: sign::PublicKey,
+                  }, DEFAULT_PRIORITY);
 
-    /// Respond to a `Post` request indicating failure.
-    pub fn send_post_failure(&mut self,
-                             src: Authority<XorName>,
-                             dst: Authority<XorName>,
-                             data_id: DataIdentifier,
-                             external_error_indicator: Vec<u8>,
-                             id: MessageId)
-                             -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::PostFailure {
-                                                 id: id,
-                                                 data_id: data_id,
-                                                 external_error_indicator: external_error_indicator,
-                                             });
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
-
-    /// Respond to a `Delete` request indicating success.
-    pub fn send_delete_success(&mut self,
-                               src: Authority<XorName>,
-                               dst: Authority<XorName>,
-                               name: DataIdentifier,
-                               id: MessageId)
-                               -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::DeleteSuccess(name, id));
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
-
-    /// Respond to a `Delete` request indicating failure.
-    pub fn send_delete_failure(&mut self,
-                               src: Authority<XorName>,
-                               dst: Authority<XorName>,
-                               data_id: DataIdentifier,
-                               external_error_indicator: Vec<u8>,
-                               id: MessageId)
-                               -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::DeleteFailure {
-                                                 id: id,
-                                                 data_id: data_id,
-                                                 external_error_indicator: external_error_indicator,
-                                             });
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
-
-    /// Respond to an `Append` request indicating success.
-    pub fn send_append_success(&mut self,
-                               src: Authority<XorName>,
-                               dst: Authority<XorName>,
-                               name: DataIdentifier,
-                               id: MessageId)
-                               -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::AppendSuccess(name, id));
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
-
-    /// Respond to an `Append` request indicating failure.
-    pub fn send_append_failure(&mut self,
-                               src: Authority<XorName>,
-                               dst: Authority<XorName>,
-                               data_id: DataIdentifier,
-                               external_error_indicator: Vec<u8>,
-                               id: MessageId)
-                               -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::AppendFailure {
-                                                 id: id,
-                                                 data_id: data_id,
-                                                 external_error_indicator: external_error_indicator,
-                                             });
-        self.send_action(src, dst, user_msg, DEFAULT_PRIORITY)
-    }
-
-    /// Respond to a `GetAccountInfo` request indicating success.
-    pub fn send_get_account_info_success(&mut self,
-                                         src: Authority<XorName>,
-                                         dst: Authority<XorName>,
-                                         data_stored: u64,
-                                         space_available: u64,
-                                         id: MessageId)
-                                         -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::GetAccountInfoSuccess {
-                                                 id: id,
-                                                 data_stored: data_stored,
-                                                 space_available: space_available,
-                                             });
-        self.send_action(src, dst, user_msg, CLIENT_GET_PRIORITY)
-    }
-
-    /// Respond to a `GetAccountInfo` request indicating failure.
-    pub fn send_get_account_info_failure(&mut self,
-                                         src: Authority<XorName>,
-                                         dst: Authority<XorName>,
-                                         external_error_indicator: Vec<u8>,
-                                         id: MessageId)
-                                         -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Response(Response::GetAccountInfoFailure {
-                                                 id: id,
-                                                 external_error_indicator: external_error_indicator,
-                                             });
-        self.send_action(src, dst, user_msg, CLIENT_GET_PRIORITY)
-    }
+    /// Send a `ChangeMDataOwner` request.
+    impl_request!(send_change_mdata_owner_request,
+                  ChangeMDataOwner {
+                      name: XorName,
+                      tag: u64,
+                      new_owners: BTreeSet<sign::PublicKey>,
+                      version: u64,
+                      msg_id: MessageId,
+                  }, DEFAULT_PRIORITY);
 
     /// Send a `Refresh` request from `src` to `dst` to trigger churn.
-    pub fn send_refresh_request(&mut self,
-                                src: Authority<XorName>,
-                                dst: Authority<XorName>,
-                                content: Vec<u8>,
-                                id: MessageId)
-                                -> Result<(), InterfaceError> {
-        let user_msg = UserMessage::Request(Request::Refresh(content, id));
-        self.send_action(src, dst, user_msg, RELOCATE_PRIORITY)
+    pub fn send_refresh_request(
+        &mut self,
+        src: Authority<XorName>,
+        dst: Authority<XorName>,
+        content: Vec<u8>,
+        msg_id: MessageId,
+    ) -> Result<(), InterfaceError> {
+        let msg = UserMessage::Request(Request::Refresh(content, msg_id));
+        self.send_action(src, dst, msg, RELOCATE_PRIORITY)
     }
+
+    /// Respond to a `GetAccountInfo` request.
+    impl_response!(send_get_account_info_response,
+                   GetAccountInfo,
+                   AccountInfo,
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `GetIData` request.
+    pub fn send_get_idata_response(
+        &mut self,
+        src: Authority<XorName>,
+        dst: Authority<XorName>,
+        res: Result<ImmutableData, ClientError>,
+        msg_id: MessageId,
+    ) -> Result<(), InterfaceError> {
+        let msg = UserMessage::Response(Response::GetIData {
+            res: res,
+            msg_id: msg_id,
+        });
+
+        let priority = relocate_priority(&dst);
+        self.send_action(src, dst, msg, priority)
+    }
+
+    /// Respond to a `PutIData` request.
+    impl_response!(send_put_idata_response, PutIData, (), DEFAULT_PRIORITY);
+
+    /// Respond to a `GetMData` request.
+    /// Note: this response is unlikely to accumulate during churn.
+    pub fn send_get_mdata_response(
+        &mut self,
+        src: Authority<XorName>,
+        dst: Authority<XorName>,
+        res: Result<MutableData, ClientError>,
+        msg_id: MessageId,
+    ) -> Result<(), InterfaceError> {
+
+        let msg = UserMessage::Response(Response::GetMData {
+            res: res,
+            msg_id: msg_id,
+        });
+
+        let priority = relocate_priority(&dst);
+        self.send_action(src, dst, msg, priority)
+    }
+
+    /// Respond to a `PutMData` request.
+    impl_response!(send_put_mdata_response, PutMData, (), DEFAULT_PRIORITY);
+
+    /// Respond to a `GetMDataVersion` request.
+    impl_response!(send_get_mdata_version_response,
+                   GetMDataVersion,
+                   u64,
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `GetMDataShell` request.
+    pub fn send_get_mdata_shell_response(
+        &mut self,
+        src: Authority<XorName>,
+        dst: Authority<XorName>,
+        res: Result<MutableData, ClientError>,
+        msg_id: MessageId,
+    ) -> Result<(), InterfaceError> {
+
+        let msg = UserMessage::Response(Response::GetMDataShell {
+            res: res,
+            msg_id: msg_id,
+        });
+
+        let priority = relocate_priority(&dst);
+        self.send_action(src, dst, msg, priority)
+    }
+
+    /// Respond to a `ListMDataEntries` request.
+    /// Note: this response is unlikely to accumulate during churn.
+    impl_response!(send_list_mdata_entries_response,
+                   ListMDataEntries,
+                   BTreeMap<Vec<u8>, Value>,
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `ListMDataKeys` request.
+    /// Note: this response is unlikely to accumulate during churn.
+    impl_response!(send_list_mdata_keys_response,
+                   ListMDataKeys,
+                   BTreeSet<Vec<u8>>,
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `ListMDataValues` request.
+    /// Note: this response is unlikely to accumulate during churn.
+    impl_response!(send_list_mdata_values_response,
+                   ListMDataValues,
+                   Vec<Value>,
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `GetMDataValue` request.
+    pub fn send_get_mdata_value_response(
+        &mut self,
+        src: Authority<XorName>,
+        dst: Authority<XorName>,
+        res: Result<Value, ClientError>,
+        msg_id: MessageId,
+    ) -> Result<(), InterfaceError> {
+
+        let msg = UserMessage::Response(Response::GetMDataValue {
+            res: res,
+            msg_id: msg_id,
+        });
+
+        let priority = relocate_priority(&dst);
+        self.send_action(src, dst, msg, priority)
+    }
+
+    /// Respond to a `MutateMDataEntries` request.
+    impl_response!(send_mutate_mdata_entries_response,
+                   MutateMDataEntries,
+                   (),
+                   DEFAULT_PRIORITY);
+
+    /// Respond to a `ListMDataPermissions` request.
+    impl_response!(send_list_mdata_permissions_response,
+                   ListMDataPermissions,
+                   BTreeMap<User, PermissionSet>,
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `ListMDataUserPermissions` request.
+    impl_response!(send_list_mdata_user_permissions_response,
+                   ListMDataUserPermissions,
+                   PermissionSet,
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `SetMDataUserPermissions` request.
+    impl_response!(send_set_mdata_user_permissions_response,
+                   SetMDataUserPermissions,
+                   (),
+                   DEFAULT_PRIORITY);
+
+    /// Respond to a `ListAuthKeysAndVersion` request.
+    impl_response!(send_list_auth_keys_and_version_response,
+                   ListAuthKeysAndVersion,
+                   (BTreeSet<sign::PublicKey>, u64),
+                   CLIENT_GET_PRIORITY);
+
+    /// Respond to a `InsAuthKey` request.
+    impl_response!(send_ins_auth_key_response,
+                   InsAuthKey,
+                   (),
+                   DEFAULT_PRIORITY);
+
+    /// Respond to a `DelAuthKey` request.
+    impl_response!(send_del_auth_key_response,
+                   DelAuthKey,
+                   (),
+                   DEFAULT_PRIORITY);
+
+    /// Respond to a `DelMDataUserPermissions` request.
+    impl_response!(send_del_mdata_user_permissions_response,
+                   DelMDataUserPermissions,
+                   (),
+                   DEFAULT_PRIORITY);
+
+    /// Respond to a `ChangeMDataOwner` request.
+    impl_response!(send_change_mdata_owner_response,
+                   ChangeMDataOwner,
+                   (),
+                   DEFAULT_PRIORITY);
 
     /// Returns the first `count` names of the nodes in the routing table which are closest
     /// to the given one.
@@ -404,17 +495,28 @@ impl Node {
         self.machine.close_group(name, count)
     }
 
-    /// Returns the name of this node.
-    pub fn name(&self) -> Result<XorName, RoutingError> {
-        self.machine.name().ok_or(RoutingError::Terminated)
+    /// Returns the `PublicId` of this node.
+    pub fn id(&self) -> Result<PublicId, RoutingError> {
+        self.machine.id().ok_or(RoutingError::Terminated)
     }
 
-    fn send_action(&mut self,
-                   src: Authority<XorName>,
-                   dst: Authority<XorName>,
-                   user_msg: UserMessage,
-                   priority: u8)
-                   -> Result<(), InterfaceError> {
+    /// Returns the routing table of this node.
+    pub fn routing_table(&self) -> Result<&RoutingTable<XorName>, RoutingError> {
+        self.machine.routing_table().ok_or(RoutingError::Terminated)
+    }
+
+    /// Returns the minimum section size this vault is using.
+    pub fn min_section_size(&self) -> usize {
+        self.machine.min_section_size()
+    }
+
+    fn send_action(
+        &mut self,
+        src: Authority<XorName>,
+        dst: Authority<XorName>,
+        user_msg: UserMessage,
+        priority: u8,
+    ) -> Result<(), InterfaceError> {
         // Make sure the state machine has processed any outstanding crust events.
         self.poll();
 
@@ -426,17 +528,15 @@ impl Node {
             result_tx: self.interface_result_tx.clone(),
         };
 
-        let transition = self.machine
-            .current_mut()
-            .handle_action(action, &mut self.event_buffer);
-        self.machine
-            .apply_transition(transition, &mut self.event_buffer);
-
-        self.receive_action_result(&self.interface_result_rx)?
-    }
-
-    fn receive_action_result<T>(&self, rx: &Receiver<T>) -> Result<T, InterfaceError> {
-        Ok(rx.recv()?)
+        let transition = self.machine.current_mut().handle_action(
+            action,
+            &mut self.event_buffer,
+        );
+        self.machine.apply_transition(
+            transition,
+            &mut self.event_buffer,
+        );
+        self.interface_result_rx.recv()?
     }
 }
 
@@ -458,44 +558,31 @@ impl EventStepper for Node {
 
 #[cfg(feature = "use-mock-crust")]
 impl Node {
-    /// Resend all unacknowledged messages.
-    pub fn resend_unacknowledged(&mut self) -> bool {
-        self.machine.current_mut().resend_unacknowledged()
-    }
-
-    /// Are there any unacknowledged messages?
-    pub fn has_unacknowledged(&mut self) -> bool {
-        self.machine.current().has_unacknowledged()
-    }
-
     /// Purge invalid routing entries.
     pub fn purge_invalid_rt_entry(&mut self) {
         self.machine.current_mut().purge_invalid_rt_entry()
     }
 
-    /// Routing table of this node.
-    pub fn routing_table(&self) -> Option<RoutingTable<XorName>> {
-        self.machine.current().routing_table().cloned()
-    }
-
     /// Check whether this node acts as a tunnel node between `client_1` and `client_2`.
-    pub fn has_tunnel_clients(&self, client_1: PeerId, client_2: PeerId) -> bool {
-        self.machine
-            .current()
-            .has_tunnel_clients(client_1, client_2)
-    }
-
-    /// Resend all unacknowledged messages.
-    pub fn clear_state(&mut self) {
-        self.machine.current_mut().clear_state();
+    pub fn has_tunnel_clients(&self, client_1: PublicId, client_2: PublicId) -> bool {
+        self.machine.current().has_tunnel_clients(
+            client_1,
+            client_2,
+        )
     }
 
     /// Returns a quorum of signatures for the neighbouring section's list or `None` if we don't
     /// have one
-    pub fn section_list_signatures(&self,
-                                   prefix: Prefix<XorName>)
-                                   -> Option<BTreeMap<PublicId, sign::Signature>> {
+    pub fn section_list_signatures(
+        &self,
+        prefix: Prefix<XorName>,
+    ) -> Option<BTreeMap<PublicId, sign::Signature>> {
         self.machine.current().section_list_signatures(prefix)
+    }
+
+    /// Returns the list of banned clients' IPs held by this node.
+    pub fn get_banned_client_ips(&self) -> BTreeSet<IpAddr> {
+        self.machine.current().get_banned_client_ips()
     }
 
     /// Returns whether the current state is `Node`.
@@ -508,16 +595,44 @@ impl Node {
     }
 
     /// Sets a name to be used when the next node relocation request is received by this node.
-    pub fn set_next_node_name(&mut self, relocation_name: XorName) {
-        self.machine
-            .current_mut()
-            .set_next_node_name(Some(relocation_name))
+    pub fn set_next_relocation_dst(&mut self, dst: XorName) {
+        self.machine.current_mut().set_next_relocation_dst(
+            Some(dst),
+        )
+    }
+
+    /// Sets an interval to be used when a node is required to generate a new name.
+    pub fn set_next_relocation_interval(&mut self, interval: (XorName, XorName)) {
+        self.machine.current_mut().set_next_relocation_interval(
+            interval,
+        )
     }
 
     /// Clears the name to be used when the next node relocation request is received by this node so
     /// the normal process is followed to calculate the relocated name.
-    pub fn clear_next_node_name(&mut self) {
-        self.machine.current_mut().set_next_node_name(None)
+    pub fn clear_next_relocation_dst(&mut self) {
+        self.machine.current_mut().set_next_relocation_dst(None)
+    }
+
+    /// Normalisation of routing connection means converting the
+    /// `PeerState::Routing(RoutingConnnection::Proxy)` or
+    /// `PeerState::Routing(RoutingConnnection::JoiningNode)` to
+    /// `PeerState::Routing(RoutingConnection::Direct` after `JOINING_NODE_TIMEOUT_SECS` seconds
+    /// have elapsed for the peer with whom we have the connection.
+    pub fn has_unnormalised_routing_conn(&self, excludes: &BTreeSet<XorName>) -> bool {
+        self.machine.current().has_unnormalised_routing_conn(
+            excludes,
+        )
+    }
+
+    /// Returns the number of received and sent user message parts.
+    pub fn get_user_msg_parts_count(&self) -> u64 {
+        self.machine.current().get_user_msg_parts_count()
+    }
+
+    /// Get the rate limiter's bandwidth usage map.
+    pub fn get_clients_usage(&self) -> BTreeMap<IpAddr, u64> {
+        unwrap!(self.machine.current().get_clients_usage())
     }
 }
 
@@ -530,10 +645,20 @@ impl Debug for Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        self.poll();
-        let _ = self.machine
-            .current_mut()
-            .handle_action(Action::Terminate, &mut self.event_buffer);
+        let _ = self.machine.current_mut().handle_action(
+            Action::Terminate,
+            &mut self.event_buffer,
+        );
         let _ = self.event_buffer.take_all();
+    }
+}
+
+// Priority of messages that might be used during relocation/churn, depending
+// on the destination.
+fn relocate_priority(dst: &Authority<XorName>) -> u8 {
+    if dst.is_client() {
+        CLIENT_GET_PRIORITY
+    } else {
+        RELOCATE_PRIORITY
     }
 }
