@@ -120,7 +120,7 @@ pub use self::network_tests::verify_network_invariant;
 pub use self::prefix::{Prefix, VersionedPrefix};
 pub use self::xorable::Xorable;
 use itertools::Itertools;
-use log::LogLevel;
+use log::Level;
 use std::{iter, mem};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -217,7 +217,7 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
     /// Creates a new `RoutingTable`.
     pub fn new(our_name: T, min_section_size: usize) -> Self {
         let mut our_section = BTreeSet::new();
-        our_section.insert(our_name);
+        let _ = our_section.insert(our_name);
         RoutingTable {
             our_name: our_name,
             min_section_size: min_section_size,
@@ -421,7 +421,7 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
     pub fn other_close_names(&self, name: &T) -> Option<BTreeSet<T>> {
         if self.our_prefix.matches(name) {
             let mut section = self.our_section.clone();
-            section.remove(&self.our_name);
+            let _ = section.remove(&self.our_name);
             Some(section)
         } else {
             None
@@ -750,7 +750,7 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
             .collect_vec();
         if !dropped_names.is_empty() {
             log_or_panic!(
-                LogLevel::Warn,
+                Level::Warn,
                 "{:?} Removed peers from RT as part of OwnSectionMerge {:?}",
                 self.our_name,
                 dropped_names
@@ -872,7 +872,7 @@ impl<T: Binary + Clone + Copy + Debug + Default + Hash + Xorable> RoutingTable<T
                 if *prefix == self.our_prefix {
                     // Exclude our name since we don't need to send to ourself
                     let mut section = section.clone();
-                    section.remove(&self.our_name);
+                    let _ = section.remove(&self.our_name);
                     return Ok(section);
                 }
                 candidates(target_name)

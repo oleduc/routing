@@ -30,7 +30,7 @@ use event::Event;
 use fake_clock::FakeClock as Instant;
 use id::{FullId, PublicId};
 use itertools::Itertools;
-use log::LogLevel;
+use log::Level;
 use lru_time_cache::LruCache;
 use maidsafe_utilities::serialisation;
 use messages::{DEFAULT_PRIORITY, DirectMessage, HopMessage, MAX_PARTS, MAX_PART_LEN, Message,
@@ -360,7 +360,7 @@ impl Node {
     }
 
     fn print_rt_size(&self) {
-        const TABLE_LVL: LogLevel = LogLevel::Info;
+        const TABLE_LVL: Level = Level::Info;
         if log_enabled!(TABLE_LVL) {
             let status_str = format!(
                 "{:?} - Routing Table size: {:3}",
@@ -2282,7 +2282,7 @@ impl Node {
                 // TODO: we should not be getting conn info req from Proxy/JoiningNode
 
                 log_or_panic!(
-                    LogLevel::Error,
+                    Level::Error,
                     "{:?} Received ConnectionInfoRequest from peer {} \
                               with invalid state.",
                     self,
@@ -2459,7 +2459,7 @@ impl Node {
         if self.tunnels.remove(dst_id, src_id) {
             debug!("{:?} Tunnel to {} via {} closed.", self, dst_id, src_id);
             if !self.crust_service.is_connected(&dst_id) {
-                self.dropped_peer(&dst_id, outbox, true);
+                let _ = self.dropped_peer(&dst_id, outbox, true);
             }
         }
     }
@@ -3115,12 +3115,12 @@ impl Node {
     fn purge_invalid_rt_entries(&mut self, outbox: &mut EventBox) -> Transition {
         let peer_details = self.peer_mgr.get_routing_peer_details();
         for pub_id in peer_details.out_of_sync_peers {
-            self.crust_service.disconnect(&pub_id);
-            self.dropped_peer(&pub_id, outbox, true);
+            let _ = self.crust_service.disconnect(&pub_id);
+            let _ = self.dropped_peer(&pub_id, outbox, true);
         }
         for removal_detail in peer_details.removal_details {
             let name = removal_detail.name;
-            self.dropped_routing_node(&name, removal_detail, outbox);
+            let _ = self.dropped_routing_node(&name, removal_detail, outbox);
         }
         let mut pub_ids_to_drop = vec![];
         for (pub_id, is_tunnel) in peer_details.routing_peer_details {
@@ -3129,7 +3129,7 @@ impl Node {
                     Some(tunnel_node_id) => {
                         if !self.crust_service.is_connected(tunnel_node_id) {
                             log_or_panic!(
-                                LogLevel::Debug,
+                                Level::Debug,
                                 "{:?} Should have a tunnel connection to {} via \
                                           {}, but tunnel node not connected.",
                                 self,
@@ -3142,7 +3142,7 @@ impl Node {
                     None => {
                         if self.crust_service.is_connected(&pub_id) {
                             log_or_panic!(
-                                LogLevel::Debug,
+                                Level::Debug,
                                 "{:?} Should have a tunnel connection to {}, but \
                                           instead have a direct connection.",
                                 self,
@@ -3151,7 +3151,7 @@ impl Node {
                             self.peer_mgr.correct_state_to_direct(&pub_id);
                         } else {
                             log_or_panic!(
-                                LogLevel::Debug,
+                                Level::Debug,
                                 "{:?} Should have a tunnel connection to {}, but no \
                                           tunnel node or direct connection exists.",
                                 self,
@@ -3163,7 +3163,7 @@ impl Node {
                 }
             } else if !self.crust_service.is_connected(&pub_id) {
                 log_or_panic!(
-                    LogLevel::Error,
+                    Level::Error,
                     "{:?} Should have a direct connection to {}, but don't.",
                     self,
                     pub_id
@@ -3860,7 +3860,7 @@ impl Node {
             })
             .collect_vec();
         for (dst_id, valid) in peers {
-            self.dropped_peer(&dst_id, outbox, false);
+            let _ = self.dropped_peer(&dst_id, outbox, false);
             debug!(
                 "{:?} Lost tunnel for peer {:?}. Requesting new tunnel.",
                 self,

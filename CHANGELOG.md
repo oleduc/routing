@@ -1,5 +1,18 @@
 # Routing - Change Log
 
+## [0.36.0]
+- Use rust 1.24.0 stable / 2018-02-05 nightly
+- rustfmt 0.9.0 and clippy-0.0.186
+
+## [0.35.0]
+- Use rust 1.22.1 stable / 2017-11-23 nightly
+- rustfmt 0.9.0 and clippy-0.0.174
+
+## [0.34.0]
+- Fix rounding error in test.
+- Depend on Crust 0.29.0.
+- Depend on rust_sodium 0.6.0.
+
 ## [0.33.2]
 - Depend on Crust 0.28.1.
 

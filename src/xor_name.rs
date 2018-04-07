@@ -15,7 +15,7 @@
 // Please review the Licences for the specific language governing permissions and limitations
 // relating to use of the SAFE Network Software.
 
-use hex::{FromHex, FromHexError, ToHex};
+use hex::{self, FromHex, FromHexError};
 use num_bigint::BigUint;
 use rand;
 use routing_table::Xorable;
@@ -60,7 +60,7 @@ pub struct XorName(pub [u8; XOR_NAME_LEN]);
 impl XorName {
     /// Hex-encode the `XorName` as a `String`.
     pub fn to_hex(&self) -> String {
-        self.0.to_hex()
+        hex::encode(self.0)
     }
 
     /// Returns the number of bits in which `self` differs from `other`.
@@ -77,7 +77,8 @@ impl XorName {
             Err(FromHexError::InvalidHexCharacter { c, index }) => {
                 return Err(XorNameFromHexError::InvalidCharacter(c, index))
             }
-            Err(FromHexError::InvalidHexLength) => return Err(XorNameFromHexError::WrongLength),
+            Err(FromHexError::InvalidStringLength) |
+            Err(FromHexError::OddLength) => return Err(XorNameFromHexError::WrongLength),
         };
         if data.len() != XOR_NAME_LEN {
             return Err(XorNameFromHexError::WrongLength);
@@ -369,7 +370,7 @@ mod tests {
 
     #[test]
     fn subtraction() {
-        for _ in 0..100000 {
+        for _ in 0..100_000 {
             let x = rand::random();
             let y = rand::random();
             let (larger, smaller) = if x > y { (x, y) } else { (y, x) };
@@ -389,11 +390,11 @@ mod tests {
 
     #[test]
     fn division() {
-        for _ in 0..100000 {
+        for _ in 0..100_000 {
             let x = rand::random();
             let y = rand::random();
-            assert_eq!(xor_from_int(x / y as u64), xor_from_int(x) / y);
-            assert_eq!(xor_from_int(1), xor_from_int(y as u64) / y);
+            assert_eq!(xor_from_int(x / u64::from(y)), xor_from_int(x) / y);
+            assert_eq!(xor_from_int(1), xor_from_int(u64::from(y)) / y);
         }
     }
 
@@ -406,11 +407,11 @@ mod tests {
     #[test]
     fn from_int() {
         assert_eq!(
-            &xor_from_int(0xabcdef)[XOR_NAME_LEN - 3..],
+            &xor_from_int(0xab_cdef)[XOR_NAME_LEN - 3..],
             &[0xab, 0xcd, 0xef]
         );
         assert_eq!(
-            xor_from_int(0xabcdef)[..XOR_NAME_LEN - 3],
+            xor_from_int(0xab_cdef)[..XOR_NAME_LEN - 3],
             XorName::default()[..XOR_NAME_LEN - 3]
         );
     }
